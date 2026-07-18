@@ -50,8 +50,12 @@ export async function readDraft(reportId: string): Promise<CachedDraft | undefin
 
 export async function removeDraft(reportId: string): Promise<void> {
   const database = await openDatabase();
-  const transaction = database.transaction(STORE_NAME, "readwrite");
-  transaction.objectStore(STORE_NAME).delete(reportId);
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    transaction.objectStore(STORE_NAME).delete(reportId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
   database.close();
 }
-
