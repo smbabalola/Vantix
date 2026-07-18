@@ -37,7 +37,9 @@ canonical_quantity = entered_packages
 ```
 
 Supported exact conversion factors are versioned domain constants. Unit dimension must match
-package content unless the entered unit is `package`. Decimal arithmetic is authoritative.
+package content unless the entered unit is `package`. Decimal arithmetic is authoritative. The
+canonical ledger quantity is rounded `ROUND_HALF_UP` to at most 12 decimal places before preview,
+cost calculation, persistence, and database validation.
 
 ## Price and cost freezing
 
@@ -85,6 +87,9 @@ frozen product/package fields, unit conversion, canonical quantity, effective pr
 currency scale, and rounded line amount. Raw SQL cannot substitute another project's snapshot,
 attach a product or price outside the snapshot authority, alter conversion/cost context, reverse
 twice, or update/delete a posted header or line.
+The header guard requires opening stock to use the project's current active snapshot and requires a
+reversal to copy the original posting's snapshot. Both rules apply on insert and on the
+transaction-local `building` to `posted` transition.
 
 ## Operational presentation
 

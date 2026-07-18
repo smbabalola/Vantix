@@ -68,6 +68,8 @@ Preview and posting carry the operator-reviewed configuration snapshot identity.
 compares current authority, returning `412 INVENTORY_AUTHORITY_CHANGED` with no ledger,
 idempotency, or audit write when authority changed. Opening occupancy is per stable product lineage,
 not project-wide.
+The database header guard independently locks the project and requires an opening header to use its
+current snapshot; reversal headers must retain the original posting's snapshot.
 
 ```text
 inventory_variance = physical_closing_count - calculated_closing
@@ -142,6 +144,8 @@ Tolerance is configuration data with value, unit, effective date, and approver. 
 ## 5. Pricing and rounding
 
 - Quantities use `Decimal` in canonical units.
+- Canonical ledger quantities are rounded `ROUND_HALF_UP` to 12 decimal places before preview,
+  pricing, persistence, and database comparison.
 - Unit price is stored as decimal with currency and price-basis unit.
 - Monetary line amount is calculated at posting and rounded `ROUND_HALF_UP` to currency minor units.
 - Each line freezes its currency minor-unit scale and stores money in `NUMERIC(30,12)`; serialized

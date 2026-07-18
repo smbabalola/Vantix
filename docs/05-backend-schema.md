@@ -772,10 +772,15 @@ Lines freeze package size/content unit and relevant display labels in metadata. 
 present when status is `ready` and all null when `unavailable`. Lines may insert only while the
 parent header is `building`; update/delete is prohibited.
 
+Canonical quantity is rounded `ROUND_HALF_UP` to 12 decimal places consistently in the domain,
+preview, stored `NUMERIC(30,12)` value, and database guard.
+
 The database line guard recomputes product/snapshot lineage, frozen package context, canonical
 conversion, effective price authority, currency scale, and rounded amount. It serializes opening
 occupancy per stable product definition, allowing different products to be opened independently
 while preventing two active openings for the same lineage.
+The header guard binds opening stock to the project's current active snapshot and reversals to the
+original posting's snapshot, including when a raw-SQL building header is transitioned to posted.
 
 ### inventory_physical_counts
 
