@@ -37,6 +37,12 @@ PROJECT_TABLES = {
     "audit_events": "project_id",
 }
 
+ORIGINAL_PROJECT_TABLES = {
+    "projects": "id",
+    "project_memberships": "project_id",
+    **{table: column for table, column in PROJECT_TABLES.items() if table != "projects"},
+}
+
 
 def upgrade() -> None:
     op.execute(
@@ -194,6 +200,40 @@ def downgrade() -> None:
     op.execute("DROP POLICY project_memberships_project_scope ON project_memberships")
     for table in TENANT_TABLES:
         op.execute(f"DROP POLICY {table}_active_membership ON {table}")
+
+    project_list = (
+        "string_to_array(NULLIF(current_setting('app.current_project_ids', true), ''), ',')"
+    )
+    for table, project_column in ORIGINAL_PROJECT_TABLES.items():
+        if table == "projects":
+            for command in ("SELECT", "UPDATE", "DELETE"):
+                op.execute(
+                    f"""
+                    CREATE POLICY {table}_{command.lower()}_project_scope
+                    ON "{table}" AS RESTRICTIVE FOR {command}
+                    USING (
+                      {project_column}::text = ANY({project_list})
+                      OR current_setting('app.is_system_service', true) = 'true'
+                    )
+                    """
+                )
+            continue
+        op.execute(
+            f"""
+            CREATE POLICY {table}_project_scope
+            ON "{table}" AS RESTRICTIVE FOR ALL
+            USING (
+              ({project_column} IS NULL AND '{table}' = 'audit_events')
+              OR {project_column}::text = ANY({project_list})
+              OR current_setting('app.is_system_service', true) = 'true'
+            )
+            WITH CHECK (
+              ({project_column} IS NULL AND '{table}' = 'audit_events')
+              OR {project_column}::text = ANY({project_list})
+              OR current_setting('app.is_system_service', true) = 'true'
+            )
+            """
+        )
     op.execute("DROP POLICY organisations_membership_policy ON organisations")
     op.execute("DROP POLICY organisation_memberships_self_policy ON organisation_memberships")
     op.execute("DROP POLICY users_self_policy ON users")

@@ -17,7 +17,8 @@ def setup_report(client: TestClient):
     editor_headers = headers(
         editor_id,
         org_id,
-        "create_project,configure_project,edit_report,submit_report,view_audit,export_report",
+        "create_project,configure_project,view_draft_report,view_client_report,"
+        "view_internal_content,edit_report,submit_report,view_audit,export_report",
     )
     project = client.post(
         f"/api/v1/organisations/{org_id}/projects",

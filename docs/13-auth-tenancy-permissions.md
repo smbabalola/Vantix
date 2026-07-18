@@ -53,6 +53,18 @@ RLS policies compare row ownership to these values. Database migrations and cont
 
 A user may have multiple roles. Permissions are evaluated as explicit capabilities, not role-name checks scattered through code.
 
+Foundation report reads use these explicit capabilities resolved from database memberships:
+
+- `view_draft_report`: view and validate mutable/submitted internal workflow revisions
+- `view_client_report`: view approved client-visible report content and create client exports
+- `view_internal_content`: receive internal/restricted content or request internal exports
+
+Every report detail, validation, preview, export, and audit path performs the same database-backed
+project capability check. Access-token capability claims are a development-adapter concern only and
+never override database membership authority. Callers without draft authority receive no draft
+existence or content disclosure. Client-visible serialization removes internal/restricted nodes on
+the server before response or rendering.
+
 ## 4. Capability matrix
 
 | Capability | Admin | Editor | Logistics | Reviewer | Approver | Client | Auditor |

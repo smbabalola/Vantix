@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from uuid import UUID, uuid4
@@ -8,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 from app.auth import AuthContext, Capability
 from app.db import SessionFactory, set_tenant_context
+from app.main import app
 from app.models import (
     AuditEvent,
     DailyReportRevision,
@@ -25,7 +29,9 @@ from app.schemas import (
     ProjectCreate,
 )
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
 ALL_CAPABILITIES = frozenset(Capability)
@@ -33,6 +39,15 @@ ALL_CAPABILITIES = frozenset(Capability)
 
 def context(user_id: UUID | None = None, organisation_id: UUID | None = None) -> AuthContext:
     return AuthContext(user_id or uuid4(), organisation_id or uuid4(), ALL_CAPABILITIES)
+
+
+def request_headers(auth: AuthContext) -> dict[str, str]:
+    return {
+        "X-Vantix-User-ID": str(auth.user_id),
+        "X-Vantix-Organisation-ID": str(auth.organisation_id),
+        # Deliberately claim everything: database memberships must still win.
+        "X-Vantix-Capabilities": ",".join(capability.value for capability in Capability),
+    }
 
 
 def add_project_member(
@@ -74,7 +89,7 @@ def add_project_member(
                 "project": project_id,
                 "user": member.user_id,
                 "role": role,
-                "caps": __import__("json").dumps(capabilities),
+                "caps": json.dumps(capabilities),
             },
         )
     engine.dispose()
@@ -327,14 +342,23 @@ def test_vtx_auth_010_client_viewer_never_receives_internal_comments() -> None:
         editor,
         project.id,
         role="approver",
-        capabilities=[Capability.APPROVE_REPORT.value],
+        capabilities=[
+            Capability.APPROVE_REPORT.value,
+            Capability.VIEW_CLIENT_REPORT.value,
+            Capability.VIEW_INTERNAL_CONTENT.value,
+        ],
     )
     approved = repository.approve_report(
         approver,
         submitted.revision.id,
         DecisionRequest(expected_checksum=submitted.revision.checksum or ""),
     )
-    client = add_project_member(editor, project.id, role="client_viewer", capabilities=[])
+    client = add_project_member(
+        editor,
+        project.id,
+        role="client_viewer",
+        capabilities=[Capability.VIEW_CLIENT_REPORT.value],
+    )
     client_report = repository.get_report(client, approved.id)
     rendered = json_text = str(client_report.revision.data)
     assert "Client note" in rendered
@@ -352,7 +376,12 @@ def test_vtx_det_006_011_exports_use_stored_frozen_payload_and_checksum() -> Non
         editor,
         project.id,
         role="approver",
-        capabilities=[Capability.APPROVE_REPORT.value, Capability.EXPORT_REPORT.value],
+        capabilities=[
+            Capability.APPROVE_REPORT.value,
+            Capability.EXPORT_REPORT.value,
+            Capability.VIEW_CLIENT_REPORT.value,
+            Capability.VIEW_INTERNAL_CONTENT.value,
+        ],
     )
     approved = repository.approve_report(
         approver,
@@ -374,11 +403,199 @@ def test_vtx_det_006_011_exports_use_stored_frozen_payload_and_checksum() -> Non
     assert first.payload_checksum == second.payload_checksum == approved.revision.checksum
 
 
+def test_vtx_mvp_006_terminal_revision_state_cannot_escape_via_repository_or_raw_sql() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project, report = prepare_report(repository, auth)
+    submitted = repository.submit_report(
+        auth, report.revision.id, report.revision.version, "submit-terminal-guard"
+    )
+
+    with pytest.raises(HTTPException) as locked:
+        repository.patch_section(
+            auth,
+            submitted.revision.id,
+            "general",
+            DraftPatch(expected_version=submitted.revision.version, data={}),
+        )
+    assert locked.value.detail["code"] == "REPORT_REVISION_LOCKED"
+
+    with pytest.raises(DBAPIError), SessionFactory.begin() as session:
+        set_tenant_context(
+            session,
+            user_id=auth.user_id,
+            organisation_id=auth.organisation_id,
+            project_ids=(project.id,),
+        )
+        session.execute(
+            text("UPDATE daily_report_revisions SET state = 'draft' WHERE id = :revision_id"),
+            {"revision_id": submitted.revision.id},
+        )
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_vtx_mvp_006_terminal_revision_state_cannot_escape_via_orm(decision: str) -> None:
+    repository = PostgresFoundationRepository()
+    editor = context()
+    project, report = prepare_report(repository, editor)
+    submitted = repository.submit_report(
+        editor, report.revision.id, report.revision.version, f"submit-{decision}-guard"
+    )
+    if decision == "approved":
+        actor = add_project_member(
+            editor,
+            project.id,
+            role="approver",
+            capabilities=[Capability.APPROVE_REPORT.value],
+        )
+        repository.approve_report(
+            actor,
+            submitted.revision.id,
+            DecisionRequest(expected_checksum=submitted.revision.checksum or ""),
+        )
+    else:
+        actor = add_project_member(
+            editor,
+            project.id,
+            role="reviewer",
+            capabilities=[Capability.REJECT_REPORT.value],
+        )
+        repository.reject_report(
+            actor,
+            submitted.revision.id,
+            DecisionRequest(
+                expected_checksum=submitted.revision.checksum or "",
+                reason="Correction required",
+            ),
+        )
+
+    with pytest.raises(DBAPIError), SessionFactory.begin() as session:
+        set_tenant_context(
+            session,
+            user_id=editor.user_id,
+            organisation_id=editor.organisation_id,
+            project_ids=(project.id,),
+        )
+        revision = session.get(DailyReportRevision, submitted.revision.id)
+        assert revision is not None
+        revision.state = "draft"
+        session.flush()
+
+
+def test_vtx_auth_010_read_endpoints_use_database_capabilities_and_visibility() -> None:
+    repository = PostgresFoundationRepository()
+    editor = context()
+    project, report = prepare_report(
+        repository,
+        editor,
+        extra_sections={
+            "comments": {
+                "items": [
+                    {"content": "Client note", "visibility": "client"},
+                    {"content": "Internal note", "visibility": "internal"},
+                ]
+            }
+        },
+    )
+    client = add_project_member(
+        editor,
+        project.id,
+        role="client_viewer",
+        capabilities=[
+            Capability.VIEW_CLIENT_REPORT.value,
+            Capability.EXPORT_REPORT.value,
+        ],
+    )
+    capabilityless = add_project_member(
+        editor,
+        project.id,
+        role="observer",
+        capabilities=[],
+    )
+
+    with pytest.raises(HTTPException) as client_draft:
+        repository.get_report(client, report.id)
+    assert client_draft.value.status_code == 404
+    with pytest.raises(HTTPException) as client_validate:
+        repository.validate_report(client, report.revision.id)
+    assert client_validate.value.detail["code"] == "CAPABILITY_DENIED"
+    with pytest.raises(HTTPException) as unprivileged_draft:
+        repository.get_report(capabilityless, report.id)
+    assert unprivileged_draft.value.status_code == 404
+
+    submitted = repository.submit_report(
+        editor, report.revision.id, report.revision.version, "submit-read-auth"
+    )
+    approver = add_project_member(
+        editor,
+        project.id,
+        role="approver",
+        capabilities=[Capability.APPROVE_REPORT.value],
+    )
+    approved = repository.approve_report(
+        approver,
+        submitted.revision.id,
+        DecisionRequest(expected_checksum=submitted.revision.checksum or ""),
+    )
+    visible = repository.get_report(client, approved.id)
+    assert "Client note" in str(visible.revision.data)
+    assert "Internal note" not in str(visible.revision.data)
+
+    with pytest.raises(HTTPException) as unprivileged_approved:
+        repository.get_report(capabilityless, approved.id)
+    assert unprivileged_approved.value.status_code == 404
+    with pytest.raises(HTTPException) as unprivileged_audit:
+        repository.audit_events(capabilityless, project.id)
+    assert unprivileged_audit.value.detail["code"] == "CAPABILITY_DENIED"
+    with pytest.raises(HTTPException) as internal_export:
+        repository.create_export(
+            client,
+            approved.revision.id,
+            ExportRequest(format="xlsx", visibility="internal"),
+            "client-internal-export",
+        )
+    assert internal_export.value.detail["code"] == "INTERNAL_VISIBILITY_DENIED"
+    client_export = repository.create_export(
+        client,
+        approved.revision.id,
+        ExportRequest(format="xlsx", visibility="client"),
+        "client-visible-export",
+    )
+    assert client_export.visibility == "client"
+
+    with TestClient(app) as api_client:
+        client_detail = api_client.get(
+            f"/api/v1/daily-reports/{approved.id}", headers=request_headers(client)
+        )
+        assert client_detail.status_code == 200
+        assert "Internal note" not in str(client_detail.json())
+        denied_detail = api_client.get(
+            f"/api/v1/daily-reports/{approved.id}", headers=request_headers(capabilityless)
+        )
+        assert denied_detail.status_code == 404
+        denied_validation = api_client.post(
+            f"/api/v1/daily-report-revisions/{approved.revision.id}/validate",
+            headers=request_headers(client),
+        )
+        assert denied_validation.status_code == 403
+        denied_audit = api_client.get(
+            f"/api/v1/projects/{project.id}/audit-events",
+            headers=request_headers(capabilityless),
+        )
+        assert denied_audit.status_code == 403
+        denied_export = api_client.post(
+            f"/api/v1/daily-report-revisions/{approved.revision.id}/exports",
+            headers={**request_headers(client), "Idempotency-Key": "api-client-internal"},
+            json={"format": "xlsx", "visibility": "internal"},
+        )
+        assert denied_export.status_code == 403
+
+
 def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0003_project_membership_roles"
+            "0004_harden_revision_transitions"
         )
         flags = connection.execute(
             text(
@@ -390,3 +607,76 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
         ).one()
         assert flags == (True, True)
     engine.dispose()
+
+
+def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:
+    admin_url = make_url(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    probe_name = f"vantix_migration_{uuid4().hex}"
+    server_url = admin_url.set(database="postgres")
+    server = create_engine(server_url, isolation_level="AUTOCOMMIT")
+    with server.connect() as connection:
+        connection.exec_driver_sql(f'CREATE DATABASE "{probe_name}"')
+
+    probe_url = admin_url.set(database=probe_name)
+    migration_environment = {**os.environ, "VANTIX_DATABASE_URL": probe_url.render_as_string(False)}
+
+    def migrate(*arguments: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", *arguments],
+            check=True,
+            cwd=os.getcwd(),
+            env=migration_environment,
+            capture_output=True,
+            text=True,
+        )
+
+    try:
+        migrate("upgrade", "head")
+        migrate("downgrade", "0001_foundation")
+        probe = create_engine(probe_url)
+        with probe.connect() as connection:
+            restored = connection.scalar(
+                text(
+                    """
+                    SELECT count(*) FROM pg_policies
+                    WHERE policyname IN (
+                      'projects_select_project_scope',
+                      'projects_update_project_scope',
+                      'projects_delete_project_scope',
+                      'project_memberships_project_scope'
+                    )
+                    """
+                )
+            )
+            assert restored == 4
+        probe.dispose()
+        migrate("upgrade", "head")
+        migrate("downgrade", "base")
+        probe = create_engine(probe_url)
+        with probe.connect() as connection:
+            residue = connection.scalar(
+                text(
+                    """
+                    SELECT
+                      (SELECT count(*) FROM pg_tables
+                       WHERE schemaname = 'public' AND tablename <> 'alembic_version')
+                      +
+                      (SELECT count(*) FROM pg_proc
+                       WHERE proname IN (
+                         'vantix_guard_revision_mutation', 'vantix_reject_mutation'
+                       ))
+                    """
+                )
+            )
+            assert residue == 0
+        probe.dispose()
+        migrate("upgrade", "head")
+    finally:
+        with server.connect() as connection:
+            connection.exec_driver_sql(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (probe_name,),
+            )
+            connection.exec_driver_sql(f'DROP DATABASE IF EXISTS "{probe_name}"')
+        server.dispose()

@@ -3,6 +3,7 @@ from io import BytesIO
 import pytest
 from app.renderers import RendererUnavailable, render_excel, render_pdf
 from openpyxl import load_workbook
+from pypdf import PdfReader
 from vantix_core.canonical import payload_checksum
 
 
@@ -37,3 +38,17 @@ def test_vtx_rpt_009_excel_embeds_authoritative_payload_checksum() -> None:
     metadata = workbook["Audit Metadata"]
     assert metadata["B1"].value == checksum
     assert workbook.sheetnames == ["Summary", "Operations", "Audit Metadata"]
+
+
+def test_vtx_rpt_009_pdf_metadata_uses_unicode_separator_without_mojibake() -> None:
+    payload = frozen_payload()
+    try:
+        artefact = render_pdf(payload, payload_checksum(payload))
+    except RendererUnavailable:
+        pytest.skip("WeasyPrint native libraries are provided by the backend container.")
+    text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(BytesIO(artefact.content)).pages
+    )
+    assert "Â" not in text
+    assert "VTX-0001" in text
+    assert "2026-07-18" in text

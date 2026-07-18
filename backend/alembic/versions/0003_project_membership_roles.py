@@ -13,9 +13,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Migration 0001 originally used Base.metadata.create_all(). On a fresh
-    # installation that means current metadata may already contain this column,
-    # while an installation upgrading from the original 0001 schema does not.
+    # IF NOT EXISTS preserves upgrade compatibility for databases created while
+    # the former 0001 migration was still coupled to then-current ORM metadata.
     op.execute(
         "ALTER TABLE project_memberships "
         "ADD COLUMN IF NOT EXISTS role VARCHAR(50) "
@@ -25,4 +24,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("ALTER TABLE project_memberships DROP COLUMN IF EXISTS role")
+    op.drop_column("project_memberships", "role")

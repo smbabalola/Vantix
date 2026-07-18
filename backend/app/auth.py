@@ -15,6 +15,9 @@ from .config import Settings, get_settings
 class Capability(StrEnum):
     CREATE_PROJECT = "create_project"
     CONFIGURE_PROJECT = "configure_project"
+    VIEW_DRAFT_REPORT = "view_draft_report"
+    VIEW_CLIENT_REPORT = "view_client_report"
+    VIEW_INTERNAL_CONTENT = "view_internal_content"
     EDIT_REPORT = "edit_report"
     SUBMIT_REPORT = "submit_report"
     REJECT_REPORT = "reject_report"
