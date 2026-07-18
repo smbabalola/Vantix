@@ -169,9 +169,9 @@ def create_project(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> ProjectView:
-    auth.require(Capability.CREATE_PROJECT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.create_project(auth, body, organisation_id)
+    auth.require(Capability.CREATE_PROJECT)
     if organisation_id != auth.organisation_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "ORGANISATION_NOT_FOUND"})
     record = repository.create_project(organisation_id, **body.model_dump())
@@ -189,9 +189,9 @@ def create_configuration(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> ConfigurationView:
-    auth.require(Capability.CONFIGURE_PROJECT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.create_configuration(auth, project_id, body)
+    auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
     version = len(project.configuration_versions) + 1
     record = {"id": uuid4(), "version": version, "state": "draft", "data": body.data}
@@ -216,9 +216,9 @@ def activate_configuration(
     repository: Repository = Depends(get_store),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ConfigurationView:
-    auth.require(Capability.CONFIGURE_PROJECT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.activate_configuration(auth, project_id, version_id, idempotency_key)
+    auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
     record = next(
         (item for item in project.configuration_versions if item["id"] == version_id), None
@@ -262,9 +262,9 @@ def create_daily_report(
     repository: Repository = Depends(get_store),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ReportView:
-    auth.require(Capability.EDIT_REPORT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.create_daily_report(auth, project_id, body, idempotency_key)
+    auth.require(Capability.EDIT_REPORT)
     project = _project(project_id, auth, repository)
     if not project.active_snapshot:
         raise HTTPException(
@@ -309,9 +309,9 @@ def patch_section(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> ReportView:
-    auth.require(Capability.EDIT_REPORT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.patch_section(auth, revision_id, section_key, body)
+    auth.require(Capability.EDIT_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
     if report.current_revision.id != revision_id:
         raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "REPORT_REVISION_LOCKED"})
@@ -332,6 +332,7 @@ def validate_report(
 ) -> ReadinessView:
     if isinstance(repository, PostgresFoundationRepository):
         return repository.validate_report(auth, revision_id)
+    auth.require(Capability.VIEW_DRAFT_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
     result = report.current_revision.readiness()
     return ReadinessView(
@@ -349,7 +350,6 @@ def submit_report(
     if_match: str = Header(alias="If-Match"),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ReportView:
-    auth.require(Capability.SUBMIT_REPORT)
     try:
         version = int(if_match.strip('"'))
     except ValueError as exc:
@@ -358,6 +358,7 @@ def submit_report(
         ) from exc
     if isinstance(repository, PostgresFoundationRepository):
         return repository.submit_report(auth, revision_id, version, idempotency_key)
+    auth.require(Capability.SUBMIT_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
 
     def submit() -> ReportView:
@@ -381,9 +382,9 @@ def reject_report(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> ReportView:
-    auth.require(Capability.REJECT_REPORT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.reject_report(auth, revision_id, body)
+    auth.require(Capability.REJECT_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
     _domain_call(
         report.reject,
@@ -402,9 +403,9 @@ def approve_report(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> ReportView:
-    auth.require(Capability.APPROVE_REPORT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.approve_report(auth, revision_id, body)
+    auth.require(Capability.APPROVE_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
     _domain_call(
         report.approve,
@@ -421,9 +422,9 @@ def audit_events(
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    auth.require(Capability.VIEW_AUDIT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.audit_events(auth, project_id)
+    auth.require(Capability.VIEW_AUDIT)
     _project(project_id, auth, repository)
     return [
         asdict(event)
@@ -441,6 +442,7 @@ def get_daily_report(
 ) -> ReportView:
     if isinstance(repository, PostgresFoundationRepository):
         return repository.get_report(auth, report_id)
+    auth.require(Capability.VIEW_CLIENT_REPORT)
     return _report_view(_report(report_id, auth, repository))
 
 
@@ -454,9 +456,9 @@ def create_export(
     repository: Repository = Depends(get_store),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ExportView:
-    auth.require(Capability.EXPORT_REPORT)
     if isinstance(repository, PostgresFoundationRepository):
         return repository.create_export(auth, revision_id, body, idempotency_key)
+    auth.require(Capability.EXPORT_REPORT)
     report = _report_for_revision(revision_id, auth, repository)
     revision = report.current_revision
     if revision.state.value != "approved" or not revision.checksum:

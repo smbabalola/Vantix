@@ -4,7 +4,17 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -134,7 +144,21 @@ class DailyReportRevision(TenantMixin, Base):
     submitted_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     approved_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     rejection_reason: Mapped[str | None] = mapped_column(Text)
-    __table_args__ = (UniqueConstraint("daily_report_id", "revision_number"),)
+    __table_args__ = (
+        UniqueConstraint("daily_report_id", "revision_number"),
+        Index(
+            "one_mutable_draft_per_report",
+            "daily_report_id",
+            unique=True,
+            postgresql_where=state.in_(["draft", "ready_for_review"]),
+        ),
+        Index(
+            "one_current_submission_per_report",
+            "daily_report_id",
+            unique=True,
+            postgresql_where=state == "submitted",
+        ),
+    )
 
 
 class ReportPayload(TenantMixin, Base):

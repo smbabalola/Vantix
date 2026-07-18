@@ -119,23 +119,35 @@ class PostgresFoundationRepository:
         project = session.scalar(select(Project).where(Project.id == project_id))
         if project is None or project.organisation_id != auth.organisation_id:
             raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_NOT_FOUND")
-        if capability is not None:
-            organisation_membership = session.get(
-                OrganisationMembership,
-                {"organisation_id": auth.organisation_id, "user_id": auth.user_id},
-            )
-            if organisation_membership and organisation_membership.role in {
-                "organisation_admin",
-                "operations_manager",
-            }:
-                return project
-            membership = session.get(
-                ProjectMembership,
-                {"project_id": project_id, "user_id": auth.user_id},
-            )
-            if membership is None or capability.value not in membership.capabilities:
-                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+        if capability is not None and capability not in self._database_capabilities(
+            session, auth, project_id
+        ):
+            raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
         return project
+
+    @staticmethod
+    def _database_capabilities(
+        session: Session, auth: AuthContext, project_id: UUID
+    ) -> frozenset[Capability]:
+        """Resolve authority from database memberships, never access-token capability claims."""
+
+        organisation_membership = session.get(
+            OrganisationMembership,
+            {"organisation_id": auth.organisation_id, "user_id": auth.user_id},
+        )
+        if organisation_membership and organisation_membership.role in {
+            "organisation_admin",
+            "operations_manager",
+        }:
+            return frozenset(Capability)
+        membership = session.get(
+            ProjectMembership,
+            {"project_id": project_id, "user_id": auth.user_id},
+        )
+        if membership is None:
+            return frozenset()
+        known = {capability.value: capability for capability in Capability}
+        return frozenset(known[value] for value in membership.capabilities if value in known)
 
     @staticmethod
     def _audit(
@@ -305,6 +317,15 @@ class PostgresFoundationRepository:
             raise _error(status.HTTP_404_NOT_FOUND, "ORGANISATION_NOT_FOUND")
         project_id = uuid4()
         with self._transaction(auth, project_ids=(project_id,)) as session:
+            organisation_membership = session.get(
+                OrganisationMembership,
+                {"organisation_id": auth.organisation_id, "user_id": auth.user_id},
+            )
+            if organisation_membership is None or organisation_membership.role not in {
+                "organisation_admin",
+                "operations_manager",
+            }:
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
             project = Project(
                 id=project_id,
                 organisation_id=auth.organisation_id,
@@ -523,13 +544,15 @@ class PostgresFoundationRepository:
                 raise _error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND")
             self._project(session, auth, project_id)
             view = self._report_view(session, report)
-            membership = session.get(
-                ProjectMembership,
-                {"project_id": project_id, "user_id": auth.user_id},
-            )
-            if membership and membership.role == "client_viewer":
-                if view.revision.state != "approved":
+            capabilities = self._database_capabilities(session, auth, project_id)
+            if view.revision.state != "approved":
+                if Capability.VIEW_DRAFT_REPORT not in capabilities:
                     raise _error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND")
+            elif not capabilities.intersection(
+                {Capability.VIEW_CLIENT_REPORT, Capability.VIEW_DRAFT_REPORT}
+            ):
+                raise _error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND")
+            if Capability.VIEW_INTERNAL_CONTENT not in capabilities:
                 filtered = filter_payload_visibility({"operations": view.revision.data}, "client")
                 view.revision.data = filtered.get("operations", {})
             return view
@@ -600,7 +623,9 @@ class PostgresFoundationRepository:
     def validate_report(self, auth: AuthContext, revision_id: UUID) -> ReadinessView:
         project_id = self._project_id_for_revision(auth, revision_id)
         with self._transaction(auth, project_ids=(project_id,)) as session:
-            revision, _ = self._revision_and_report(session, auth, revision_id, None)
+            revision, _ = self._revision_and_report(
+                session, auth, revision_id, Capability.VIEW_DRAFT_REPORT
+            )
             result = validate_foundation_readiness(
                 configuration_snapshot_id=str(revision.configuration_snapshot_id),
                 report_data=revision.data,
@@ -892,6 +917,21 @@ class PostgresFoundationRepository:
             )
             if payload is None:
                 raise _error(status.HTTP_500_INTERNAL_SERVER_ERROR, "FROZEN_PAYLOAD_MISSING")
+            capabilities = self._database_capabilities(session, auth, project_id)
+            required_visibility = (
+                Capability.VIEW_INTERNAL_CONTENT
+                if body.visibility == "internal"
+                else Capability.VIEW_CLIENT_REPORT
+            )
+            if required_visibility not in capabilities:
+                code = (
+                    "INTERNAL_VISIBILITY_DENIED"
+                    if body.visibility == "internal"
+                    else "CAPABILITY_DENIED"
+                )
+                raise _error(status.HTTP_403_FORBIDDEN, code)
+            if Capability.EXPORT_REPORT not in capabilities:
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
             render_payload = filter_payload_visibility(payload.payload_json, body.visibility)
             artefact = render_report(body.format, render_payload, payload.payload_checksum)
             export = ReportExport(

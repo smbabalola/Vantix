@@ -85,6 +85,8 @@ Online only. Idempotent.
 ### `GET /daily-reports/{report_id}`
 
 Returns aggregate, active draft/submitted/approved revision references, state, and permissions.
+Requires database-backed `view_draft_report` for non-approved revisions or `view_client_report` for
+approved client content. Internal/restricted fields additionally require `view_internal_content`.
 
 ### `GET /daily-reports/{report_id}/revisions`
 
@@ -103,6 +105,7 @@ Requires optimistic concurrency. Returns new version and readiness delta.
 ### `POST /daily-report-revisions/{revision_id}/validate`
 
 Returns full readiness, reconciliation, and warnings without state change.
+Requires database-backed `view_draft_report`; client-only and capability-less memberships are denied.
 
 ### `POST /daily-report-revisions/{revision_id}/submit`
 
@@ -144,6 +147,9 @@ Body:
 - format: pdf/xlsx
 - visibility: client/internal
 - template version optional only for draft preview; approved regeneration uses original version
+
+Internal visibility additionally requires `view_internal_content`; client visibility requires
+`view_client_report`. Requested visibility can never elevate the caller's database-derived access.
 
 Returns export job.
 
