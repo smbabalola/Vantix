@@ -110,9 +110,15 @@ select { min-height: 44px; padding: 9px 10px; border: 1px solid #cbd7d5; border-
 .inventory-grid-row { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf9; }
 .inventory-grid-row > div { display: grid; gap: 4px; }
 .inventory-grid-row small { color: var(--muted); }
-.reversal-panel, .inventory-history { margin-top: 20px; }
+.reversal-panel, .inventory-history, .inventory-preview { margin-top: 20px; }
 .reversal-panel { display: grid; gap: 14px; }
-.inventory-history article { display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.inventory-preview article { display: grid; gap: 6px; margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf9; }
+.inventory-context { grid-template-columns: minmax(0, 2fr) minmax(160px, 1fr); }
+.inventory-history article { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.inventory-history-card { display: grid; gap: 7px; }
+.inventory-history-card header { display: grid; grid-template-columns: 1fr auto auto; gap: 14px; align-items: center; }
+.inventory-history-card small { color: var(--muted); overflow-wrap: anywhere; }
+.history-line { display: grid; gap: 4px; margin-top: 5px; padding: 10px; border-left: 3px solid var(--teal); background: #f8faf9; font-size: 13px; }
 .inventory-history article span:not(.state-badge) { color: var(--muted); font-size: 13px; }
 
 @media (max-width: 900px) {

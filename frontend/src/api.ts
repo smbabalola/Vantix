@@ -3,6 +3,7 @@ import type {
   GeneralSection,
   InventoryPosting,
   OpeningStockAuthority,
+  OpeningStockPreview,
   Project,
   ProjectConfiguration,
   ProjectProduct,
@@ -205,13 +206,34 @@ export const api = {
     session: Session,
     projectId: string,
     postingDate: string,
+    configurationSnapshotId: string,
     lines: Array<{ product_definition_id: string; entered_quantity: string; entered_unit_code: string }>,
     idempotencyKey: string,
   ): Promise<InventoryPosting> {
     return request(session, `/projects/${projectId}/inventory-postings/opening-stock`, {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ posting_date: postingDate, lines }),
+      body: JSON.stringify({
+        expected_configuration_snapshot_id: configurationSnapshotId,
+        posting_date: postingDate,
+        lines,
+      }),
+    });
+  },
+  previewOpeningStock(
+    session: Session,
+    projectId: string,
+    postingDate: string,
+    configurationSnapshotId: string,
+    lines: Array<{ product_definition_id: string; entered_quantity: string; entered_unit_code: string }>,
+  ): Promise<OpeningStockPreview> {
+    return request(session, `/projects/${projectId}/inventory-postings/opening-stock/preview`, {
+      method: "POST",
+      body: JSON.stringify({
+        expected_configuration_snapshot_id: configurationSnapshotId,
+        posting_date: postingDate,
+        lines,
+      }),
     });
   },
   reverseInventoryPosting(

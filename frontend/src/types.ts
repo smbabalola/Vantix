@@ -139,6 +139,7 @@ export interface OpeningStockAuthorityProduct {
   package_unit_code: PackageContentUnitCode;
   inventory_unit_code: ProductUnitCode;
   price: ProductPrice | null;
+  opened_by_posting_id: string | null;
 }
 
 export interface OpeningStockAuthority {
@@ -160,9 +161,42 @@ export interface InventoryLedgerLine {
   price_status: "ready" | "unavailable";
   applied_unit_price: string | null;
   price_basis_unit_code: ProductUnitCode | null;
+  price_effective_from: string | null;
+  price_effective_to: string | null;
   currency: string | null;
+  currency_minor_unit_scale: number | null;
   posted_line_amount: string | null;
   frozen_product: Record<string, unknown>;
+}
+
+export interface OpeningStockPreviewLine {
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  item_code: string;
+  item_name: string;
+  entered_quantity: string;
+  entered_unit_code: ProductUnitCode;
+  package_size: string;
+  package_unit_code: PackageContentUnitCode;
+  canonical_quantity: string;
+  canonical_unit_code: "kg" | "L" | "each";
+  package_count: string;
+  price_status: "ready" | "unavailable";
+  applied_unit_price: string | null;
+  price_basis_unit_code: ProductUnitCode | null;
+  price_effective_from: string | null;
+  price_effective_to: string | null;
+  currency: string | null;
+  currency_minor_unit_scale: number | null;
+  line_amount: string | null;
+}
+
+export interface OpeningStockPreview {
+  project_id: string;
+  posting_date: string;
+  configuration_snapshot_id: string;
+  lines: OpeningStockPreviewLine[];
+  currencies: Record<string, string>;
 }
 
 export interface InventoryPosting {
