@@ -101,7 +101,7 @@ export default function ProductPricingGrid({
   const [priceDrafts, setPriceDrafts] = useState<Record<string, PriceDraft>>({});
   const [dirtyProductIds, setDirtyProductIds] = useState<Set<string>>(new Set());
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [message, setMessage] = useState("Loading productsâ€¦");
+  const [message, setMessage] = useState("Loading products…");
   const savedProductsRef = useRef(new Map<string, ProjectProduct>());
   const pendingRef = useRef(false);
   const configurationVersionRef = useRef(configuration.row_version);
@@ -153,7 +153,7 @@ export default function ProductPricingGrid({
     pendingRef.current = true;
     onPendingChange(true);
     setFieldErrors({});
-    setMessage("Saving product configurationâ€¦");
+    setMessage("Saving product configuration…");
     try {
       await operation();
       setMessage("Product configuration saved");
@@ -257,7 +257,7 @@ export default function ProductPricingGrid({
               <div className="price-history">
                 <strong>Effective price history ({currency})</strong>
                 {product.prices.length === 0 ? <span className="state-badge state-incomplete">Price required</span> : product.prices.map((price) => (
-                  <div className="price-row" key={price.id}><span>{price.effective_from} â†’ {price.effective_to ?? "open"}</span><span>{price.unit_price} {price.currency} / {price.price_basis_unit_code}</span><button className="button danger" disabled={disabled || rowDirty || priceDirty} onClick={() => void run(async () => commitProduct(await api.deleteProductPrice(session, currentConfiguration(), price.id)), (field) => priceErrorKey(product.id, field))}>Remove price</button></div>
+                  <div className="price-row" key={price.id}><span>{price.effective_from} → {price.effective_to ?? "open"}</span><span>{price.unit_price} {price.currency} / {price.price_basis_unit_code}</span><button className="button danger" disabled={disabled || rowDirty || priceDirty} onClick={() => void run(async () => commitProduct(await api.deleteProductPrice(session, currentConfiguration(), price.id)), (field) => priceErrorKey(product.id, field))}>Remove price</button></div>
                 ))}
                 <div className="price-row price-entry">
                   <label>From<input type="date" disabled={disabled || rowDirty} required value={priceDraft.effective_from} onChange={(event) => updatePriceDraft(product.id, { effective_from: event.target.value })} /><FieldError message={fieldErrors[`price:${product.id}:effective_from`]} /></label>

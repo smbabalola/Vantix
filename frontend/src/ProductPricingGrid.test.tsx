@@ -106,7 +106,16 @@ describe("product and pricing grid", () => {
       inventory_unit_code: "package",
       specific_gravity: null,
       active: true,
-      prices: [],
+      prices: [{
+        id: "00000000-0000-4000-8000-000000000016",
+        project_product_id: "00000000-0000-4000-8000-000000000014",
+        effective_from: "2026-01-01",
+        effective_to: null,
+        unit_price: "4.5",
+        currency: "GBP",
+        price_basis_unit_code: "L",
+        source: null,
+      }],
     };
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => response([product]))
@@ -130,6 +139,7 @@ describe("product and pricing grid", () => {
       />,
     );
     expect(await screen.findByText("Product authority loaded")).toBeInTheDocument();
+    expect(screen.getByText("2026-01-01 → open")).toBeInTheDocument();
     const applicability = screen.getAllByLabelText("Inventory applicable");
     fireEvent.click(applicability[1]);
     expect(screen.getAllByLabelText("Inventory unit")[1]).toBeDisabled();
