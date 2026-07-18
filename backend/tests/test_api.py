@@ -109,6 +109,118 @@ def setup_report(client: TestClient):
     return org_id, editor_id, editor_headers, project, report
 
 
+def test_vtx_pro_004_005_opening_stock_is_idempotent_and_historically_frozen(
+    client: TestClient,
+    foundation_store: FoundationStore,
+) -> None:
+    _, _, editor_headers, project, _ = setup_report(client)
+    inventory_headers = {
+        **editor_headers,
+        "X-Vantix-Capabilities": editor_headers["X-Vantix-Capabilities"]
+        + ",view_inventory,post_inventory",
+        "Idempotency-Key": "opening-stock-1",
+    }
+    authority = client.get(
+        f"/api/v1/projects/{project['id']}/inventory/opening-stock-authority",
+        headers=inventory_headers,
+        params={"posting_date": "2026-07-18"},
+    )
+    assert authority.status_code == 200
+    post_only_headers = {**inventory_headers, "X-Vantix-Capabilities": "post_inventory"}
+    assert (
+        client.get(
+            f"/api/v1/projects/{project['id']}/inventory/opening-stock-authority",
+            headers=post_only_headers,
+            params={"posting_date": "2026-07-18"},
+        ).status_code
+        == 200
+    )
+    product = authority.json()["products"][0]
+    request = {
+        "posting_date": "2026-07-18",
+        "lines": [
+            {
+                "product_definition_id": product["product_definition_id"],
+                "entered_quantity": "4",
+                "entered_unit_code": "package",
+            }
+        ],
+    }
+    posted = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
+        headers=inventory_headers,
+        json=request,
+    )
+    assert posted.status_code == 201
+    assert posted.json()["lines"][0]["canonical_signed_quantity"] == "100"
+    assert posted.json()["lines"][0]["posted_line_amount"] == "74.00"
+    assert (
+        client.post(
+            f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
+            headers=inventory_headers,
+            json=request,
+        ).json()
+        == posted.json()
+    )
+    conflict = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
+        headers=inventory_headers,
+        json={**request, "posting_date": "2026-07-19"},
+    )
+    assert conflict.status_code == 409
+
+    price = next(iter(foundation_store.product_prices.values()))
+    price["unit_price"] = "999"
+    history = client.get(
+        f"/api/v1/projects/{project['id']}/inventory-postings", headers=inventory_headers
+    ).json()
+    assert history[0]["lines"][0]["applied_unit_price"] == "18.5"
+    assert history[0]["lines"][0]["posted_line_amount"] == "74.00"
+
+
+def test_vtx_rec_004_opening_reversal_is_exact_and_preserves_original(
+    client: TestClient,
+) -> None:
+    _, _, editor_headers, project, _ = setup_report(client)
+    inventory_headers = {
+        **editor_headers,
+        "X-Vantix-Capabilities": editor_headers["X-Vantix-Capabilities"]
+        + ",view_inventory,post_inventory",
+    }
+    authority = client.get(
+        f"/api/v1/projects/{project['id']}/inventory/opening-stock-authority",
+        headers=inventory_headers,
+        params={"posting_date": "2026-07-18"},
+    ).json()
+    posted = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
+        headers={**inventory_headers, "Idempotency-Key": "opening-stock-reverse"},
+        json={
+            "posting_date": "2026-07-18",
+            "lines": [
+                {
+                    "product_definition_id": authority["products"][0]["product_definition_id"],
+                    "entered_quantity": "4",
+                    "entered_unit_code": "package",
+                }
+            ],
+        },
+    ).json()
+    reversal = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/{posted['id']}/reversals",
+        headers={**inventory_headers, "Idempotency-Key": "reverse-opening-1"},
+        json={"posting_date": "2026-07-19", "reason": "Opening count correction"},
+    )
+    assert reversal.status_code == 201
+    assert reversal.json()["lines"][0]["canonical_signed_quantity"] == "-100"
+    assert reversal.json()["lines"][0]["posted_line_amount"] == "-74"
+    history = client.get(
+        f"/api/v1/projects/{project['id']}/inventory-postings", headers=inventory_headers
+    ).json()
+    assert len(history) == 2
+    assert history[0]["reversal_posting_id"] == reversal.json()["id"]
+
+
 def test_vtx_api_003_cross_tenant_project_returns_no_data(client: TestClient) -> None:
     _, _, _, project, _ = setup_report(client)
     response = client.post(

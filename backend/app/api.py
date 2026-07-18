@@ -5,12 +5,13 @@ import json
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from vantix_core.canonical import payload_checksum
+from vantix_core.inventory import InventoryValidationError, build_opening_line, build_reversal_line
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
     DailyReport,
@@ -45,6 +46,11 @@ from .schemas import (
     DraftPatch,
     ExportRequest,
     ExportView,
+    InventoryPostingView,
+    InventoryReversalCreate,
+    OpeningStockAuthorityProduct,
+    OpeningStockAuthorityView,
+    OpeningStockCreate,
     OrganisationCreate,
     OrganisationView,
     ProductPriceCreate,
@@ -819,6 +825,316 @@ def get_product_price_at(
     if selected is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PRICE_NOT_EFFECTIVE"})
     return ProductPriceView.model_validate(selected)
+
+
+def _memory_active_products(
+    repository: FoundationStore, project: ProjectRecord
+) -> list[dict[str, Any]]:
+    if project.active_snapshot is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "ACTIVE_CONFIGURATION_REQUIRED"}
+        )
+    configuration = next(
+        (
+            item
+            for item in project.configuration_versions
+            if item["version"] == project.active_snapshot.version
+        ),
+        None,
+    )
+    if configuration is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "ACTIVE_CONFIGURATION_REQUIRED"}
+        )
+    return [
+        product
+        for product in repository.project_products.values()
+        if product["configuration_version_id"] == configuration["id"]
+        and product["inventory_applicable"]
+        and product["active"]
+    ]
+
+
+@router.get(
+    "/projects/{project_id}/inventory/opening-stock-authority",
+    response_model=OpeningStockAuthorityView,
+)
+def opening_stock_authority(
+    project_id: UUID,
+    posting_date: date,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> OpeningStockAuthorityView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.opening_stock_authority(auth, project_id, posting_date)
+    if not auth.capabilities.intersection({Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "CAPABILITY_DENIED"})
+    project = _project(project_id, auth, repository)
+    products = sorted(
+        _memory_active_products(repository, project), key=lambda item: str(item["item_code"])
+    )
+    assert project.active_snapshot is not None
+    return OpeningStockAuthorityView(
+        project_id=project_id,
+        posting_date=posting_date,
+        configuration_snapshot_id=project.active_snapshot.id,
+        products=[
+            OpeningStockAuthorityProduct(
+                product_definition_id=product["product_definition_id"],
+                configuration_product_version_id=product["id"],
+                item_code=product["item_code"],
+                item_name=product["item_name"],
+                package_size=str(product["package_size"]),
+                package_unit_code=product["package_unit_code"],
+                inventory_unit_code=product["inventory_unit_code"],
+                price=(
+                    ProductPriceView.model_validate(selected)
+                    if (
+                        selected := select_effective_price(
+                            [
+                                price
+                                for price in repository.product_prices.values()
+                                if price["project_product_id"] == product["id"]
+                            ],
+                            posting_date,
+                        )
+                    )
+                    else None
+                ),
+            )
+            for product in products
+        ],
+    )
+
+
+@router.post(
+    "/projects/{project_id}/inventory-postings/opening-stock",
+    response_model=InventoryPostingView,
+    status_code=201,
+)
+def post_opening_stock(
+    project_id: UUID,
+    body: OpeningStockCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> InventoryPostingView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.post_opening_stock(auth, project_id, body, idempotency_key)
+    auth.require(Capability.POST_INVENTORY)
+    project = _project(project_id, auth, repository)
+    request_hash = _request_hash({"project_id": str(project_id), **body.model_dump(mode="json")})
+
+    def post() -> InventoryPostingView:
+        if any(
+            item["project_id"] == project_id
+            and item["posting_type"] == "opening_stock"
+            and item.get("reversal_posting_id") is None
+            for item in repository.inventory_postings.values()
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail={"code": "OPENING_STOCK_ALREADY_POSTED"}
+            )
+        products = {
+            UUID(str(item["product_definition_id"])): item
+            for item in _memory_active_products(repository, project)
+        }
+        if len(body.lines) != len({line.product_definition_id for line in body.lines}):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "DUPLICATE_OPENING_PRODUCT"}
+            )
+        if any(line.product_definition_id not in products for line in body.lines):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "OPENING_PRODUCT_NOT_AUTHORISED"},
+            )
+        assert project.active_snapshot is not None
+        posting_id = uuid4()
+        now = datetime.now(UTC)
+        lines: list[dict[str, Any]] = []
+        for request_line in body.lines:
+            product = products[request_line.product_definition_id]
+            price = select_effective_price(
+                [
+                    value
+                    for value in repository.product_prices.values()
+                    if value["project_product_id"] == product["id"]
+                ],
+                body.posting_date,
+            )
+            frozen_product = {
+                key: product.get(key)
+                for key in (
+                    "item_code",
+                    "item_name",
+                    "packaging",
+                    "package_size",
+                    "package_unit_code",
+                    "inventory_unit_code",
+                    "specific_gravity",
+                )
+            }
+            try:
+                frozen = build_opening_line(
+                    entered_quantity=request_line.entered_quantity,
+                    entered_unit_code=request_line.entered_unit_code,
+                    product=frozen_product,
+                    price=price,
+                )
+            except InventoryValidationError as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": exc.code, "message": str(exc), "field": exc.field},
+                ) from exc
+            line_id = uuid4()
+            line = {
+                "id": line_id,
+                "product_definition_id": product["product_definition_id"],
+                "configuration_product_version_id": product["id"],
+                **frozen,
+                "frozen_product": deepcopy(frozen_product),
+            }
+            lines.append(line)
+            repository.inventory_lines[line_id] = {**line, "posting_id": posting_id}
+        stored = {
+            "id": posting_id,
+            "project_id": project_id,
+            "source_configuration_snapshot_id": project.active_snapshot.id,
+            "posting_type": "opening_stock",
+            "status": "posted",
+            "posting_date": body.posting_date,
+            "reversal_of_posting_id": None,
+            "reversal_posting_id": None,
+            "reason": None,
+            "posted_by": auth.user_id,
+            "posted_at": now,
+            "lines": lines,
+        }
+        repository.inventory_postings[posting_id] = stored
+        return InventoryPostingView.model_validate(stored)
+
+    try:
+        return repository.idempotent(
+            organisation_id=auth.organisation_id,
+            operation_type="post_opening_stock",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            operation=post,
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "IDEMPOTENCY_KEY_REUSED"}
+        ) from exc
+
+
+@router.get("/projects/{project_id}/inventory-postings", response_model=list[InventoryPostingView])
+def list_inventory_postings(
+    project_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> list[InventoryPostingView]:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.list_inventory_postings(auth, project_id)
+    if not auth.capabilities.intersection({Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "CAPABILITY_DENIED"})
+    _project(project_id, auth, repository)
+    return [
+        InventoryPostingView.model_validate(item)
+        for item in sorted(
+            (
+                item
+                for item in repository.inventory_postings.values()
+                if item["project_id"] == project_id
+            ),
+            key=lambda item: (item["posting_date"], item["posted_at"]),
+        )
+    ]
+
+
+@router.post(
+    "/projects/{project_id}/inventory-postings/{posting_id}/reversals",
+    response_model=InventoryPostingView,
+    status_code=201,
+)
+def reverse_inventory_posting(
+    project_id: UUID,
+    posting_id: UUID,
+    body: InventoryReversalCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> InventoryPostingView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.reverse_inventory_posting(
+            auth, project_id, posting_id, body, idempotency_key
+        )
+    auth.require(Capability.POST_INVENTORY)
+    _project(project_id, auth, repository)
+    request_hash = _request_hash(
+        {
+            "project_id": str(project_id),
+            "posting_id": str(posting_id),
+            **body.model_dump(mode="json"),
+        }
+    )
+
+    def reverse() -> InventoryPostingView:
+        original = repository.inventory_postings.get(posting_id)
+        if (
+            not original
+            or original["project_id"] != project_id
+            or original["posting_type"] != "opening_stock"
+        ):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail={"code": "INVENTORY_POSTING_NOT_REVERSIBLE"}
+            )
+        if original.get("reversal_posting_id"):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, detail={"code": "INVENTORY_POSTING_ALREADY_REVERSED"}
+            )
+        if body.posting_date < original["posting_date"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "REVERSAL_DATE_PRECEDES_ORIGINAL"},
+            )
+        reversal_id = uuid4()
+        lines = []
+        for source in original["lines"]:
+            frozen = build_reversal_line(source)
+            line_id = uuid4()
+            line = {**source, **frozen, "id": line_id}
+            lines.append(line)
+            repository.inventory_lines[line_id] = {**line, "posting_id": reversal_id}
+        stored = {
+            "id": reversal_id,
+            "project_id": project_id,
+            "source_configuration_snapshot_id": original["source_configuration_snapshot_id"],
+            "posting_type": "reversal",
+            "status": "posted",
+            "posting_date": body.posting_date,
+            "reversal_of_posting_id": posting_id,
+            "reversal_posting_id": None,
+            "reason": body.reason,
+            "posted_by": auth.user_id,
+            "posted_at": datetime.now(UTC),
+            "lines": lines,
+        }
+        original["reversal_posting_id"] = reversal_id
+        repository.inventory_postings[reversal_id] = stored
+        return InventoryPostingView.model_validate(stored)
+
+    try:
+        return repository.idempotent(
+            organisation_id=auth.organisation_id,
+            operation_type="reverse_inventory_posting",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            operation=reverse,
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "IDEMPOTENCY_KEY_REUSED"}
+        ) from exc
 
 
 @router.patch("/product-prices/{price_id}", response_model=ProjectProductView)

@@ -163,6 +163,72 @@ class ProjectProductView(ProjectProductFields):
     prices: list[ProductPriceView]
 
 
+class OpeningStockAuthorityProduct(BaseModel):
+    product_definition_id: UUID
+    configuration_product_version_id: UUID
+    item_code: str
+    item_name: str
+    package_size: str
+    package_unit_code: PackageContentUnitCode
+    inventory_unit_code: ProductUnitCode
+    price: ProductPriceView | None
+
+
+class OpeningStockAuthorityView(BaseModel):
+    project_id: UUID
+    posting_date: date
+    configuration_snapshot_id: UUID
+    products: list[OpeningStockAuthorityProduct]
+
+
+class OpeningStockLineCreate(BaseModel):
+    product_definition_id: UUID
+    entered_quantity: str
+    entered_unit_code: ProductUnitCode
+
+
+class OpeningStockCreate(BaseModel):
+    posting_date: date
+    lines: list[OpeningStockLineCreate] = Field(min_length=1)
+
+
+class InventoryReversalCreate(BaseModel):
+    posting_date: date
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class InventoryLedgerLineView(BaseModel):
+    id: UUID
+    product_definition_id: UUID
+    configuration_product_version_id: UUID
+    product_price_version_id: UUID | None
+    entered_quantity: str
+    entered_unit_code: ProductUnitCode
+    canonical_signed_quantity: str
+    canonical_unit_code: Literal["kg", "L", "each"]
+    price_status: Literal["ready", "unavailable"]
+    applied_unit_price: str | None
+    price_basis_unit_code: ProductUnitCode | None
+    currency: str | None
+    posted_line_amount: str | None
+    frozen_product: dict[str, Any]
+
+
+class InventoryPostingView(BaseModel):
+    id: UUID
+    project_id: UUID
+    source_configuration_snapshot_id: UUID
+    posting_type: Literal["opening_stock", "reversal"]
+    status: Literal["posted"]
+    posting_date: date
+    reversal_of_posting_id: UUID | None
+    reversal_posting_id: UUID | None = None
+    reason: str | None
+    posted_by: UUID
+    posted_at: datetime
+    lines: list[InventoryLedgerLineView]
+
+
 class DailyReportCreate(BaseModel):
     report_date: date
     report_number: str = Field(min_length=1, max_length=100)

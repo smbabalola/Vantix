@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -18,6 +19,8 @@ from app.models import (
     ConfigurationVersion,
     DailyReport,
     DailyReportRevision,
+    InventoryLedgerLine,
+    InventoryPosting,
     Project,
     ProjectProduct,
     ReportPayload,
@@ -31,14 +34,18 @@ from app.schemas import (
     DecisionRequest,
     DraftPatch,
     ExportRequest,
+    InventoryReversalCreate,
+    OpeningStockCreate,
+    OpeningStockLineCreate,
     OrganisationCreate,
     ProductPriceCreate,
+    ProductPricePatch,
     ProjectCreate,
     ProjectProductCreate,
 )
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, text, update
+from sqlalchemy import create_engine, delete, func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
@@ -1608,7 +1615,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_project_products_pricing"
+            "0007_inventory_opening_stock"
         )
         flags = connection.execute(
             text(
@@ -1636,6 +1643,147 @@ def test_vtx_mvp_001_alembic_metadata_has_no_schema_drift() -> None:
         text=True,
     )
     assert "No new upgrade operations detected" in result.stdout
+
+
+def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    activate_configuration(repository, auth, project.id, configuration.id, "activate-opening-v1")
+    authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    product = authority.products[0]
+    request = OpeningStockCreate(
+        posting_date="2026-07-18",
+        lines=[
+            OpeningStockLineCreate(
+                product_definition_id=product.product_definition_id,
+                entered_quantity="4",
+                entered_unit_code="package",
+            )
+        ],
+    )
+    posted = repository.post_opening_stock(auth, project.id, request, "opening-live-1")
+    assert posted.lines[0].canonical_signed_quantity == "100"
+    assert posted.lines[0].applied_unit_price == "18.5"
+    assert posted.lines[0].posted_line_amount == "74"
+    assert (
+        repository.post_opening_stock(auth, project.id, request, "opening-live-1").id == posted.id
+    )
+    with pytest.raises(HTTPException) as reused:
+        repository.post_opening_stock(
+            auth,
+            project.id,
+            request.model_copy(update={"posting_date": date(2026, 7, 19)}),
+            "opening-live-1",
+        )
+    assert reused.value.status_code == 409
+
+    draft_v2 = create_configuration(
+        repository, auth, project.id, ConfigurationCreate(copy_active=True), "opening-v2"
+    )
+    copied_product = repository.list_products(auth, project.id, draft_v2.id)[0]
+    copied_price = copied_product.prices[0]
+    updated_product = repository.patch_product_price(
+        auth,
+        copied_price.id,
+        ProductPricePatch(
+            expected_configuration_version=draft_v2.row_version,
+            effective_from=copied_price.effective_from,
+            effective_to=copied_price.effective_to,
+            unit_price="999",
+            currency="GBP",
+            price_basis_unit_code="package",
+        ),
+    )
+    readiness = repository.validate_configuration(auth, project.id, draft_v2.id)
+    repository.activate_configuration(
+        auth,
+        project.id,
+        draft_v2.id,
+        "activate-opening-v2",
+        updated_product.configuration_row_version,
+        readiness.draft_checksum,
+    )
+    historical = repository.list_inventory_postings(auth, project.id)[0]
+    assert historical.lines[0].applied_unit_price == "18.5"
+    assert historical.lines[0].posted_line_amount == "74"
+
+    reversal = repository.reverse_inventory_posting(
+        auth,
+        project.id,
+        posted.id,
+        InventoryReversalCreate(
+            posting_date="2026-07-19", reason="Verified opening count correction"
+        ),
+        "reverse-opening-live-1",
+    )
+    assert (
+        reversal.lines[0].configuration_product_version_id
+        == posted.lines[0].configuration_product_version_id
+    )
+    assert reversal.lines[0].product_price_version_id == posted.lines[0].product_price_version_id
+    assert reversal.lines[0].canonical_signed_quantity == "-100"
+    assert reversal.lines[0].posted_line_amount == "-74"
+
+    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            update(InventoryLedgerLine)
+            .where(InventoryLedgerLine.id == posted.lines[0].id)
+            .values(canonical_signed_quantity=999)
+        )
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            update(InventoryPosting)
+            .where(InventoryPosting.id == posted.id)
+            .values(status="building")
+        )
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            delete(InventoryLedgerLine).where(InventoryLedgerLine.id == posted.lines[0].id)
+        )
+    admin.dispose()
+
+
+def test_vtx_auth_004_inventory_tables_enforce_cross_tenant_rls() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    activate_configuration(repository, auth, project.id, configuration.id, "activate-inventory-rls")
+    authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    repository.post_opening_stock(
+        auth,
+        project.id,
+        OpeningStockCreate(
+            posting_date="2026-07-18",
+            lines=[
+                OpeningStockLineCreate(
+                    product_definition_id=authority.products[0].product_definition_id,
+                    entered_quantity="1",
+                    entered_unit_code="package",
+                )
+            ],
+        ),
+        "opening-rls",
+    )
+    poster = add_project_member(auth, project.id, role="logistics", capabilities=["post_inventory"])
+    assert (
+        repository.opening_stock_authority(poster, project.id, date(2026, 7, 18)).project_id
+        == project.id
+    )
+    assert len(repository.list_inventory_postings(poster, project.id)) == 1
+    outsider = context()
+    with SessionFactory.begin() as session:
+        set_tenant_context(
+            session,
+            user_id=outsider.user_id,
+            organisation_id=outsider.organisation_id,
+            project_ids=(project.id,),
+        )
+        assert session.scalar(select(func.count()).select_from(InventoryPosting)) == 0
+        assert session.scalar(select(func.count()).select_from(InventoryLedgerLine)) == 0
 
 
 def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:

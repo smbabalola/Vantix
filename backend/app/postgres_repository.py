@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
+from vantix_core.inventory import InventoryValidationError, build_opening_line, build_reversal_line
 from vantix_core.products import (
     ProductValidationError,
     canonicalise_product,
@@ -39,6 +40,8 @@ from .models import (
     DailyReport,
     DailyReportRevision,
     IdempotencyRecord,
+    InventoryLedgerLine,
+    InventoryPosting,
     Organisation,
     OrganisationMembership,
     ProductDefinition,
@@ -64,6 +67,12 @@ from .schemas import (
     DraftPatch,
     ExportRequest,
     ExportView,
+    InventoryLedgerLineView,
+    InventoryPostingView,
+    InventoryReversalCreate,
+    OpeningStockAuthorityProduct,
+    OpeningStockAuthorityView,
+    OpeningStockCreate,
     OrganisationCreate,
     OrganisationView,
     ProductPriceCreate,
@@ -1148,6 +1157,454 @@ class PostgresFoundationRepository:
             if selected is None:
                 raise _error(status.HTTP_404_NOT_FOUND, "PRICE_NOT_EFFECTIVE")
             return ProductPriceView.model_validate(selected)
+
+    @classmethod
+    def _inventory_line_view(cls, line: InventoryLedgerLine) -> InventoryLedgerLineView:
+        return InventoryLedgerLineView(
+            id=line.id,
+            product_definition_id=line.product_definition_id,
+            configuration_product_version_id=line.configuration_product_version_id,
+            product_price_version_id=line.product_price_version_id,
+            entered_quantity=cls._decimal_string(line.entered_quantity),
+            entered_unit_code=cast(Any, line.entered_unit_code),
+            canonical_signed_quantity=cls._decimal_string(line.canonical_signed_quantity),
+            canonical_unit_code=cast(Any, line.canonical_unit_code),
+            price_status=cast(Any, line.price_status),
+            applied_unit_price=(
+                cls._decimal_string(line.applied_unit_price)
+                if line.applied_unit_price is not None
+                else None
+            ),
+            price_basis_unit_code=cast(Any, line.price_basis_unit_code),
+            currency=line.currency,
+            posted_line_amount=(
+                cls._decimal_string(line.posted_line_amount)
+                if line.posted_line_amount is not None
+                else None
+            ),
+            frozen_product=deepcopy(line.frozen_product_json),
+        )
+
+    @classmethod
+    def _inventory_posting_view(
+        cls, session: Session, posting: InventoryPosting
+    ) -> InventoryPostingView:
+        lines = session.scalars(
+            select(InventoryLedgerLine)
+            .where(InventoryLedgerLine.posting_id == posting.id)
+            .order_by(InventoryLedgerLine.product_definition_id)
+        ).all()
+        reversal_id = session.scalar(
+            select(InventoryPosting.id).where(
+                InventoryPosting.reversal_of_posting_id == posting.id,
+                InventoryPosting.status == "posted",
+            )
+        )
+        return InventoryPostingView(
+            id=posting.id,
+            project_id=posting.project_id,
+            source_configuration_snapshot_id=posting.source_configuration_snapshot_id,
+            posting_type=cast(Any, posting.posting_type),
+            status="posted",
+            posting_date=posting.posting_date,
+            reversal_of_posting_id=posting.reversal_of_posting_id,
+            reversal_posting_id=reversal_id,
+            reason=posting.reason,
+            posted_by=posting.posted_by,
+            posted_at=posting.posted_at,
+            lines=[cls._inventory_line_view(line) for line in lines],
+        )
+
+    @staticmethod
+    def _inventory_error(exc: InventoryValidationError) -> HTTPException:
+        return HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": exc.code, "message": str(exc), "field": exc.field},
+        )
+
+    def opening_stock_authority(
+        self, auth: AuthContext, project_id: UUID, posting_date: date
+    ) -> OpeningStockAuthorityView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = self._project(session, auth, project_id)
+            capabilities = self._database_capabilities(session, auth, project_id)
+            if not capabilities.intersection(
+                {Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            if (
+                not project.current_configuration_version_id
+                or not project.current_configuration_snapshot_id
+            ):
+                raise _error(status.HTTP_409_CONFLICT, "ACTIVE_CONFIGURATION_REQUIRED")
+            products = session.scalars(
+                select(ProjectProduct)
+                .where(
+                    ProjectProduct.configuration_version_id
+                    == project.current_configuration_version_id,
+                    ProjectProduct.inventory_applicable.is_(True),
+                    ProjectProduct.active.is_(True),
+                )
+                .order_by(ProjectProduct.item_code, ProjectProduct.id)
+            ).all()
+            authority_products: list[OpeningStockAuthorityProduct] = []
+            for product in products:
+                prices = session.scalars(
+                    select(ProductPrice)
+                    .where(ProductPrice.project_product_id == product.id)
+                    .order_by(ProductPrice.effective_from, ProductPrice.id)
+                ).all()
+                selected = select_effective_price(
+                    [self._price_view(price).model_dump(mode="json") for price in prices],
+                    posting_date,
+                )
+                authority_products.append(
+                    OpeningStockAuthorityProduct(
+                        product_definition_id=product.product_definition_id,
+                        configuration_product_version_id=product.id,
+                        item_code=product.item_code,
+                        item_name=product.item_name,
+                        package_size=self._decimal_string(product.package_size),
+                        package_unit_code=cast(Any, product.package_unit_code),
+                        inventory_unit_code=cast(Any, product.inventory_unit_code),
+                        price=ProductPriceView.model_validate(selected) if selected else None,
+                    )
+                )
+            return OpeningStockAuthorityView(
+                project_id=project.id,
+                posting_date=posting_date,
+                configuration_snapshot_id=project.current_configuration_snapshot_id,
+                products=authority_products,
+            )
+
+    def post_opening_stock(
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        body: OpeningStockCreate,
+        idempotency_key: str,
+    ) -> InventoryPostingView:
+        request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+        request_hash = _request_hash(request)
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
+            )
+            if project is None or project.organisation_id != auth.organisation_id:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_NOT_FOUND")
+            if Capability.POST_INVENTORY not in self._database_capabilities(
+                session, auth, project_id
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "post_opening_stock", idempotency_key, request_hash
+            )
+            if existing:
+                return InventoryPostingView.model_validate(existing.response_json)
+            if (
+                not project.current_configuration_version_id
+                or not project.current_configuration_snapshot_id
+            ):
+                raise _error(status.HTTP_409_CONFLICT, "ACTIVE_CONFIGURATION_REQUIRED")
+            definition_ids = [line.product_definition_id for line in body.lines]
+            if len(definition_ids) != len(set(definition_ids)):
+                raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "DUPLICATE_OPENING_PRODUCT")
+            session.scalars(
+                select(ProductDefinition)
+                .where(ProductDefinition.id.in_(sorted(definition_ids, key=str)))
+                .order_by(ProductDefinition.id)
+                .with_for_update()
+            ).all()
+            opening_ids = session.scalars(
+                select(InventoryPosting.id).where(
+                    InventoryPosting.project_id == project_id,
+                    InventoryPosting.posting_type == "opening_stock",
+                    InventoryPosting.status == "posted",
+                )
+            ).all()
+            if any(
+                session.scalar(
+                    select(InventoryPosting.id).where(
+                        InventoryPosting.reversal_of_posting_id == opening_id,
+                        InventoryPosting.status == "posted",
+                    )
+                )
+                is None
+                for opening_id in opening_ids
+            ):
+                raise _error(status.HTTP_409_CONFLICT, "OPENING_STOCK_ALREADY_POSTED")
+            products = session.scalars(
+                select(ProjectProduct).where(
+                    ProjectProduct.configuration_version_id
+                    == project.current_configuration_version_id,
+                    ProjectProduct.product_definition_id.in_(definition_ids),
+                    ProjectProduct.inventory_applicable.is_(True),
+                    ProjectProduct.active.is_(True),
+                )
+            ).all()
+            by_definition = {product.product_definition_id: product for product in products}
+            if set(by_definition) != set(definition_ids):
+                raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "OPENING_PRODUCT_NOT_AUTHORISED")
+            posting = InventoryPosting(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project_id,
+                source_configuration_snapshot_id=project.current_configuration_snapshot_id,
+                posting_type="opening_stock",
+                status="building",
+                posting_date=body.posting_date,
+                reversal_of_posting_id=None,
+                reason=None,
+                posted_by=auth.user_id,
+            )
+            session.add(posting)
+            session.flush()
+            for requested in body.lines:
+                product = by_definition[requested.product_definition_id]
+                price = session.scalar(
+                    select(ProductPrice)
+                    .where(
+                        ProductPrice.project_product_id == product.id,
+                        ProductPrice.effective_from <= body.posting_date,
+                        (
+                            ProductPrice.effective_to.is_(None)
+                            | (ProductPrice.effective_to > body.posting_date)
+                        ),
+                    )
+                    .order_by(ProductPrice.effective_from.desc())
+                    .limit(1)
+                )
+                frozen_product = {
+                    "item_code": product.item_code,
+                    "item_name": product.item_name,
+                    "packaging": product.packaging,
+                    "package_size": self._decimal_string(product.package_size),
+                    "package_unit_code": product.package_unit_code,
+                    "inventory_unit_code": product.inventory_unit_code,
+                    "specific_gravity": (
+                        self._decimal_string(product.specific_gravity)
+                        if product.specific_gravity is not None
+                        else None
+                    ),
+                }
+                try:
+                    frozen = build_opening_line(
+                        entered_quantity=requested.entered_quantity,
+                        entered_unit_code=requested.entered_unit_code,
+                        product=frozen_product,
+                        price=(
+                            {
+                                "id": price.id,
+                                "unit_price": price.unit_price,
+                                "price_basis_unit_code": price.price_basis_unit_code,
+                                "currency": price.currency,
+                            }
+                            if price
+                            else None
+                        ),
+                    )
+                except InventoryValidationError as exc:
+                    raise self._inventory_error(exc) from exc
+                session.add(
+                    InventoryLedgerLine(
+                        id=uuid4(),
+                        organisation_id=auth.organisation_id,
+                        project_id=project_id,
+                        posting_id=posting.id,
+                        product_definition_id=product.product_definition_id,
+                        configuration_product_version_id=product.id,
+                        product_price_version_id=(price.id if price else None),
+                        entered_quantity=Decimal(frozen["entered_quantity"]),
+                        entered_unit_code=frozen["entered_unit_code"],
+                        canonical_signed_quantity=Decimal(frozen["canonical_signed_quantity"]),
+                        canonical_unit_code=frozen["canonical_unit_code"],
+                        price_status=frozen["price_status"],
+                        applied_unit_price=(
+                            Decimal(frozen["applied_unit_price"])
+                            if frozen["applied_unit_price"]
+                            else None
+                        ),
+                        price_basis_unit_code=frozen["price_basis_unit_code"],
+                        currency=frozen["currency"],
+                        posted_line_amount=(
+                            Decimal(frozen["posted_line_amount"])
+                            if frozen["posted_line_amount"]
+                            else None
+                        ),
+                        frozen_product_json=frozen_product,
+                    )
+                )
+            posting.status = "posted"
+            session.flush()
+            response = self._inventory_posting_view(session, posting)
+            self._audit(
+                session,
+                auth,
+                project_id=project_id,
+                entity_type="inventory_posting",
+                entity_id=posting.id,
+                action="post_opening_stock",
+                before=None,
+                after=response.model_dump(mode="json"),
+            )
+            self._remember_idempotency(
+                session,
+                auth,
+                "post_opening_stock",
+                idempotency_key,
+                request_hash,
+                "inventory_posting",
+                posting.id,
+                response,
+                201,
+            )
+            return response
+
+    def reverse_inventory_posting(
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        posting_id: UUID,
+        body: InventoryReversalCreate,
+        idempotency_key: str,
+    ) -> InventoryPostingView:
+        request = {
+            "project_id": str(project_id),
+            "posting_id": str(posting_id),
+            **body.model_dump(mode="json"),
+        }
+        request_hash = _request_hash(request)
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            self._project(session, auth, project_id, Capability.POST_INVENTORY)
+            existing = self._lock_idempotency(
+                session, auth, "reverse_inventory_posting", idempotency_key, request_hash
+            )
+            if existing:
+                return InventoryPostingView.model_validate(existing.response_json)
+            original = session.scalar(
+                select(InventoryPosting)
+                .where(InventoryPosting.id == posting_id, InventoryPosting.project_id == project_id)
+                .with_for_update()
+            )
+            if (
+                original is None
+                or original.posting_type != "opening_stock"
+                or original.status != "posted"
+            ):
+                raise _error(status.HTTP_404_NOT_FOUND, "INVENTORY_POSTING_NOT_REVERSIBLE")
+            if body.posting_date < original.posting_date:
+                raise _error(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY, "REVERSAL_DATE_PRECEDES_ORIGINAL"
+                )
+            if session.scalar(
+                select(InventoryPosting.id).where(
+                    InventoryPosting.reversal_of_posting_id == original.id
+                )
+            ):
+                raise _error(status.HTTP_409_CONFLICT, "INVENTORY_POSTING_ALREADY_REVERSED")
+            reversal = InventoryPosting(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project_id,
+                source_configuration_snapshot_id=original.source_configuration_snapshot_id,
+                posting_type="reversal",
+                status="building",
+                posting_date=body.posting_date,
+                reversal_of_posting_id=original.id,
+                reason=body.reason.strip(),
+                posted_by=auth.user_id,
+            )
+            session.add(reversal)
+            session.flush()
+            original_lines = session.scalars(
+                select(InventoryLedgerLine)
+                .where(InventoryLedgerLine.posting_id == original.id)
+                .order_by(InventoryLedgerLine.product_definition_id)
+            ).all()
+            for original_line in original_lines:
+                frozen = build_reversal_line(
+                    {
+                        "entered_quantity": self._decimal_string(original_line.entered_quantity),
+                        "canonical_signed_quantity": self._decimal_string(
+                            original_line.canonical_signed_quantity
+                        ),
+                        "posted_line_amount": (
+                            self._decimal_string(original_line.posted_line_amount)
+                            if original_line.posted_line_amount is not None
+                            else None
+                        ),
+                    }
+                )
+                session.add(
+                    InventoryLedgerLine(
+                        id=uuid4(),
+                        organisation_id=auth.organisation_id,
+                        project_id=project_id,
+                        posting_id=reversal.id,
+                        product_definition_id=original_line.product_definition_id,
+                        configuration_product_version_id=original_line.configuration_product_version_id,
+                        product_price_version_id=original_line.product_price_version_id,
+                        entered_quantity=Decimal(frozen["entered_quantity"]),
+                        entered_unit_code=original_line.entered_unit_code,
+                        canonical_signed_quantity=Decimal(frozen["canonical_signed_quantity"]),
+                        canonical_unit_code=original_line.canonical_unit_code,
+                        price_status=original_line.price_status,
+                        applied_unit_price=original_line.applied_unit_price,
+                        price_basis_unit_code=original_line.price_basis_unit_code,
+                        currency=original_line.currency,
+                        posted_line_amount=(
+                            Decimal(frozen["posted_line_amount"])
+                            if frozen["posted_line_amount"]
+                            else None
+                        ),
+                        frozen_product_json=deepcopy(original_line.frozen_product_json),
+                    )
+                )
+            reversal.status = "posted"
+            session.flush()
+            response = self._inventory_posting_view(session, reversal)
+            self._audit(
+                session,
+                auth,
+                project_id=project_id,
+                entity_type="inventory_posting",
+                entity_id=reversal.id,
+                action="reverse",
+                before=None,
+                after=response.model_dump(mode="json"),
+                reason=reversal.reason,
+            )
+            self._remember_idempotency(
+                session,
+                auth,
+                "reverse_inventory_posting",
+                idempotency_key,
+                request_hash,
+                "inventory_posting",
+                reversal.id,
+                response,
+                201,
+            )
+            return response
+
+    def list_inventory_postings(
+        self, auth: AuthContext, project_id: UUID
+    ) -> list[InventoryPostingView]:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            self._project(session, auth, project_id)
+            capabilities = self._database_capabilities(session, auth, project_id)
+            if not capabilities.intersection(
+                {Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            postings = session.scalars(
+                select(InventoryPosting)
+                .where(
+                    InventoryPosting.project_id == project_id, InventoryPosting.status == "posted"
+                )
+                .order_by(InventoryPosting.posting_date, InventoryPosting.posted_at)
+            ).all()
+            return [self._inventory_posting_view(session, posting) for posting in postings]
 
     def validate_configuration(
         self, auth: AuthContext, project_id: UUID, version_id: UUID

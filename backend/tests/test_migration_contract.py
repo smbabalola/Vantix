@@ -13,6 +13,9 @@ CONFIGURATION_LIFECYCLE = Path(
 PRODUCTS_PRICING = Path("backend/alembic/versions/0006_project_products_pricing.py").read_text(
     encoding="utf-8"
 )
+INVENTORY_LEDGER = Path("backend/alembic/versions/0007_inventory_opening_stock.py").read_text(
+    encoding="utf-8"
+)
 
 
 def test_vtx_auth_004_005_tenant_tables_enable_and_force_rls() -> None:
@@ -88,3 +91,15 @@ def test_vtx_pro_002_product_price_periods_rls_and_immutability_are_database_gua
     assert 'op.drop_table("product_price_history")' in downgrade
     assert 'op.drop_table("project_products")' in downgrade
     assert 'op.drop_table("project_product_definitions")' in downgrade
+
+
+def test_vtx_pro_004_005_inventory_postings_are_append_only_rls_guarded_and_reversible() -> None:
+    assert "inventory_postings_guard" in INVENTORY_LEDGER
+    assert "inventory_ledger_lines_guard" in INVENTORY_LEDGER
+    assert "posted inventory is append-only" in INVENTORY_LEDGER
+    assert "reversal line must exactly negate frozen original" in INVENTORY_LEDGER
+    assert "FORCE ROW LEVEL SECURITY" in INVENTORY_LEDGER
+    downgrade = INVENTORY_LEDGER.split("def downgrade()", maxsplit=1)[1]
+    assert "DROP FUNCTION IF EXISTS vantix_guard_inventory_line()" in downgrade
+    assert 'op.drop_table("inventory_ledger_lines")' in downgrade
+    assert 'op.drop_table("inventory_postings")' in downgrade
