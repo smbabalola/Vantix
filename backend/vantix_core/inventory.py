@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any
 
 UNIT_DIMENSIONS = {
@@ -55,6 +55,8 @@ CURRENCY_MINOR_UNITS = {
     "OMR": 3,
     "TND": 3,
 }
+CANONICAL_QUANTITY_SCALE = 12
+CANONICAL_QUANTITY_QUANTUM = Decimal(1).scaleb(-CANONICAL_QUANTITY_SCALE)
 
 
 class InventoryValidationError(ValueError):
@@ -87,6 +89,21 @@ def currency_minor_unit_scale(currency: str) -> int:
 
 def money_string(value: Decimal, scale: int) -> str:
     return format(value, f".{scale}f")
+
+
+def canonical_quantity(value: Decimal) -> Decimal:
+    """Round a canonical ledger quantity to its persisted 12-decimal authority."""
+
+    with localcontext() as context:
+        context.prec = max(38, len(value.as_tuple().digits) + CANONICAL_QUANTITY_SCALE)
+        rounded = value.quantize(CANONICAL_QUANTITY_QUANTUM, rounding=ROUND_HALF_UP)
+    if rounded <= 0:
+        raise InventoryValidationError(
+            "INVENTORY_QUANTITY_BELOW_PRECISION",
+            "entered_quantity",
+            "Quantity is below canonical ledger precision.",
+        )
+    return rounded
 
 
 def convert_opening_quantity(
@@ -131,6 +148,7 @@ def convert_opening_quantity(
                 "Entered unit must match the package-content dimension.",
             )
         canonical = quantity * UNIT_TO_CANONICAL[entered_unit_code]
+    canonical = canonical_quantity(canonical)
     return decimal_string(canonical), CANONICAL_UNITS[package_dimension]
 
 

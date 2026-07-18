@@ -1618,7 +1618,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_inventory_opening_stock"
+            "0008_inventory_authority_precision"
         )
         flags = connection.execute(
             text(
@@ -1630,6 +1630,119 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
         ).one()
         assert flags == (True, True)
     engine.dispose()
+
+
+def test_vtx_mvp_001_upgrade_from_merged_0007_installs_inventory_runtime_guards() -> None:
+    migration_environment = {
+        **os.environ,
+        "VANTIX_DATABASE_URL": os.environ["VANTIX_ADMIN_DATABASE_URL"],
+    }
+
+    def migrate(*arguments: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", *arguments],
+            check=True,
+            cwd=os.getcwd(),
+            env=migration_environment,
+            capture_output=True,
+            text=True,
+        )
+
+    migrate("downgrade", "0007_inventory_opening_stock")
+    try:
+        admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+        with admin.connect() as connection:
+            old_posting_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_posting()'::regprocedure)")
+            )
+            old_line_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_line()'::regprocedure)")
+            )
+            assert "opening stock requires the current configuration snapshot" not in str(
+                old_posting_guard
+            )
+            assert "round(expected_canonical, 12)" not in str(old_line_guard)
+
+        repository = PostgresFoundationRepository()
+        auth = context()
+        project = prepare_project(repository, auth)
+        first = create_configuration(repository, auth, project.id, valid_configuration())
+        active_v1 = activate_configuration(
+            repository, auth, project.id, first.id, "upgrade-path-v1"
+        )
+        assert active_v1.snapshot_id is not None
+        authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+        original = repository.post_opening_stock(
+            auth,
+            project.id,
+            OpeningStockCreate(
+                expected_configuration_snapshot_id=active_v1.snapshot_id,
+                posting_date="2026-07-18",
+                lines=[
+                    OpeningStockLineCreate(
+                        product_definition_id=authority.products[0].product_definition_id,
+                        entered_quantity="1",
+                        entered_unit_code="package",
+                    )
+                ],
+            ),
+            "upgrade-path-opening",
+        )
+        second = create_configuration(
+            repository, auth, project.id, ConfigurationCreate(copy_active=True), "upgrade-path-v2"
+        )
+        active_v2 = activate_configuration(
+            repository, auth, project.id, second.id, "upgrade-path-activate-v2"
+        )
+        assert active_v2.snapshot_id is not None
+
+        migrate("upgrade", "0008_inventory_authority_precision")
+        with admin.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0008_inventory_authority_precision"
+            )
+            posting_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_posting()'::regprocedure)")
+            )
+            line_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_line()'::regprocedure)")
+            )
+            assert "opening stock requires the current configuration snapshot" in str(posting_guard)
+            assert "round(expected_canonical, 12)" in str(line_guard)
+
+        with pytest.raises(DBAPIError), admin.begin() as connection:
+            connection.execute(
+                insert(InventoryPosting).values(
+                    id=uuid4(),
+                    organisation_id=auth.organisation_id,
+                    project_id=project.id,
+                    source_configuration_snapshot_id=active_v1.snapshot_id,
+                    posting_type="opening_stock",
+                    status="building",
+                    posting_date=date(2026, 7, 18),
+                    reversal_of_posting_id=None,
+                    reason=None,
+                    posted_by=auth.user_id,
+                )
+            )
+        with pytest.raises(DBAPIError), admin.begin() as connection:
+            connection.execute(
+                insert(InventoryPosting).values(
+                    id=uuid4(),
+                    organisation_id=auth.organisation_id,
+                    project_id=project.id,
+                    source_configuration_snapshot_id=active_v2.snapshot_id,
+                    posting_type="reversal",
+                    status="building",
+                    posting_date=date(2026, 7, 19),
+                    reversal_of_posting_id=original.id,
+                    reason="Wrong snapshot after upgrade",
+                    posted_by=auth.user_id,
+                )
+            )
+        admin.dispose()
+    finally:
+        migrate("upgrade", "head")
 
 
 def test_vtx_mvp_001_alembic_metadata_has_no_schema_drift() -> None:
@@ -1701,7 +1814,7 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
         ),
     )
     readiness = repository.validate_configuration(auth, project.id, draft_v2.id)
-    repository.activate_configuration(
+    active_v2 = repository.activate_configuration(
         auth,
         project.id,
         draft_v2.id,
@@ -1712,6 +1825,24 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     historical = repository.list_inventory_postings(auth, project.id)[0]
     assert historical.lines[0].applied_unit_price == "18.5"
     assert historical.lines[0].posted_line_amount == "74.00"
+
+    assert active_v2.snapshot_id is not None
+    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=active_v2.snapshot_id,
+                posting_type="reversal",
+                status="building",
+                posting_date=date(2026, 7, 19),
+                reversal_of_posting_id=posted.id,
+                reason="Forged reversal snapshot",
+                posted_by=auth.user_id,
+            )
+        )
 
     reversal = repository.reverse_inventory_posting(
         auth,
@@ -1730,7 +1861,6 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     assert reversal.lines[0].canonical_signed_quantity == "-100"
     assert reversal.lines[0].posted_line_amount == "-74.00"
 
-    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with pytest.raises(DBAPIError), admin.begin() as connection:
         connection.execute(
             update(InventoryLedgerLine)
@@ -1858,6 +1988,21 @@ def test_vtx_pro_004_stale_reviewed_snapshot_rolls_back_posting_idempotency_and_
     assert repository.list_inventory_postings(auth, project.id) == []
     assert len(repository.audit_events(auth, project.id)) == audit_before
     admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=old_authority.configuration_snapshot_id,
+                posting_type="opening_stock",
+                status="building",
+                posting_date=date(2026, 7, 18),
+                reversal_of_posting_id=None,
+                reason=None,
+                posted_by=auth.user_id,
+            )
+        )
     with admin.connect() as connection:
         assert (
             connection.scalar(
@@ -2069,6 +2214,36 @@ def test_vtx_cst_001_four_decimal_currency_survives_posting_and_reversal_exactly
     )
     assert reversed_posting.lines[0].currency_minor_unit_scale == 4
     assert reversed_posting.lines[0].posted_line_amount == "-3.7035"
+
+
+def test_vtx_unit_002_high_precision_conversion_matches_preview_and_posted_ledger() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-precision"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    request = OpeningStockCreate(
+        expected_configuration_snapshot_id=active.snapshot_id,
+        posting_date="2026-07-18",
+        lines=[
+            OpeningStockLineCreate(
+                product_definition_id=authority.products[0].product_definition_id,
+                entered_quantity="1.000000000001",
+                entered_unit_code="lb",
+            )
+        ],
+    )
+
+    preview = repository.preview_opening_stock(auth, project.id, request)
+    posted = repository.post_opening_stock(auth, project.id, request, "precision-opening")
+
+    assert preview.lines[0].entered_quantity == "1.000000000001"
+    assert preview.lines[0].canonical_quantity == "0.45359237"
+    assert posted.lines[0].canonical_signed_quantity == preview.lines[0].canonical_quantity
 
 
 def test_vtx_pro_004_database_rejects_forged_frozen_opening_authority() -> None:

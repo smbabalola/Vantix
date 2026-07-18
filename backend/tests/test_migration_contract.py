@@ -16,6 +16,9 @@ PRODUCTS_PRICING = Path("backend/alembic/versions/0006_project_products_pricing.
 INVENTORY_LEDGER = Path("backend/alembic/versions/0007_inventory_opening_stock.py").read_text(
     encoding="utf-8"
 )
+INVENTORY_HARDENING = Path(
+    "backend/alembic/versions/0008_inventory_authority_precision.py"
+).read_text(encoding="utf-8")
 
 
 def test_vtx_auth_004_005_tenant_tables_enable_and_force_rls() -> None:
@@ -109,3 +112,15 @@ def test_vtx_pro_004_005_inventory_postings_are_append_only_rls_guarded_and_reve
     assert "DROP FUNCTION IF EXISTS vantix_guard_inventory_line()" in downgrade
     assert 'op.drop_table("inventory_ledger_lines")' in downgrade
     assert 'op.drop_table("inventory_postings")' in downgrade
+
+
+def test_vtx_pro_004_inventory_hardening_is_delivered_after_merged_0007() -> None:
+    assert 'revision: str = "0008_inventory_authority_precision"' in INVENTORY_HARDENING
+    assert 'down_revision: str | None = "0007_inventory_opening_stock"' in INVENTORY_HARDENING
+    assert "CREATE OR REPLACE FUNCTION vantix_guard_inventory_posting()" in INVENTORY_HARDENING
+    assert "CREATE OR REPLACE FUNCTION vantix_guard_inventory_line()" in INVENTORY_HARDENING
+    assert "opening stock requires the current configuration snapshot" in INVENTORY_HARDENING
+    assert "round(expected_canonical, 12)" in INVENTORY_HARDENING
+    downgrade = INVENTORY_HARDENING.split("def downgrade()", maxsplit=1)[1]
+    assert "_posting_guard(hardened=False)" in downgrade
+    assert "_line_guard(rounded=False)" in downgrade

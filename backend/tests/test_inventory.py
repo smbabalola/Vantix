@@ -18,6 +18,15 @@ def test_vtx_pro_005_packages_convert_to_positive_canonical_content() -> None:
     assert unit == "kg"
 
 
+def test_vtx_unit_002_canonical_quantity_rounds_half_up_to_ledger_scale() -> None:
+    quantity, unit = convert_opening_quantity(
+        "1.000000000001", "lb", package_size="25", package_unit_code="kg"
+    )
+    assert quantity == "0.45359237"
+    assert Decimal(quantity) == Decimal("0.453592370000")
+    assert unit == "kg"
+
+
 def test_vtx_unit_002_content_units_must_match_package_dimension() -> None:
     with pytest.raises(InventoryValidationError) as mismatch:
         convert_opening_quantity("5", "L", package_size="25", package_unit_code="kg")
