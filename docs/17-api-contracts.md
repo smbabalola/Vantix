@@ -231,14 +231,25 @@ Returns selected price and basis for diagnostics.
 
 Online, `view_inventory` or `post_inventory`. Returns active inventory-applicable product versions,
 stable product identities, package/inventory units, and effective price preview. Missing effective
-price returns explicit `unavailable` with null price fields.
+price returns explicit `unavailable` with null price fields. Each product states whether its stable
+lineage already has an unreversed opening and identifies that posting.
+
+### `POST /projects/{project_id}/inventory-postings/opening-stock/preview`
+
+Online, `post_inventory`. Body contains `expected_configuration_snapshot_id`, explicit
+`posting_date`, and proposed lines. It returns the server-derived canonical/package conversions,
+effective price period and basis, fixed-scale line amounts, currency totals, and unavailable-price
+states without writing ledger or audit data. A changed active snapshot returns
+`412 INVENTORY_AUTHORITY_CHANGED`.
 
 ### `POST /projects/{project_id}/inventory-postings/opening-stock`
 
-Online, `post_inventory`, and `Idempotency-Key`. Body contains explicit `posting_date` and one or
-more product-version/entered-quantity/unit lines. Server derives stable identity, canonical signed
+Online, `post_inventory`, and `Idempotency-Key`. Body contains
+`expected_configuration_snapshot_id`, explicit `posting_date`, and one or more
+product-version/entered-quantity/unit lines. Server derives stable identity, canonical signed
 quantity/unit, selected price, currency, and rounded line amount. Header, lines, idempotency, and
-audit commit atomically. Same-key/same-request returns the original result; different request is 409.
+audit commit atomically. Same-key/same-request returns the original result; different request is
+409. The active snapshot is locked and compared before any write; changed authority returns 412.
 
 ### `GET /projects/{project_id}/inventory-postings`
 

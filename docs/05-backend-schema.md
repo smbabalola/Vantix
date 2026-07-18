@@ -759,8 +759,10 @@ remain unchanged when a linked reversal is added.
 - canonical_unit_code
 - applied_unit_price nullable
 - price_basis_unit_code nullable
+- price_effective_from/to nullable
 - currency nullable
-- posted_line_amount nullable
+- currency_minor_unit_scale nullable
+- posted_line_amount numeric(30,12) nullable
 - price_status: ready / unavailable
 - counterparty_project_id nullable
 - metadata_json
@@ -769,6 +771,11 @@ Positive canonical quantity increases stock; negative quantity decreases stock. 
 Lines freeze package size/content unit and relevant display labels in metadata. Price fields are all
 present when status is `ready` and all null when `unavailable`. Lines may insert only while the
 parent header is `building`; update/delete is prohibited.
+
+The database line guard recomputes product/snapshot lineage, frozen package context, canonical
+conversion, effective price authority, currency scale, and rounded amount. It serializes opening
+occupancy per stable product definition, allowing different products to be opened independently
+while preventing two active openings for the same lineage.
 
 ### inventory_physical_counts
 
