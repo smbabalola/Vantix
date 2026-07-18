@@ -24,6 +24,8 @@ class Capability(StrEnum):
     APPROVE_REPORT = "approve_report"
     VIEW_AUDIT = "view_audit"
     EXPORT_REPORT = "export_report"
+    VIEW_INVENTORY = "view_inventory"
+    POST_INVENTORY = "post_inventory"
 
 
 @dataclass(frozen=True, slots=True)

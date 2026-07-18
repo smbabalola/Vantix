@@ -136,7 +136,8 @@ Observed: item code/name, alternate name, batch, unit size, unit, packaging, pri
 - package-counted stock may be priced per package or any unit dimensionally compatible with package
   content; an effective-from date requires explicit user entry
 - any unsaved product or price draft invalidates readiness and blocks validation/activation
-- starting quantity and its opening transaction are deferred to the inventory-ledger slice; this slice never creates stock
+- starting quantity is never an editable product field; the inventory-ledger opening-stock slice
+  creates an immutable, idempotent project posting bound to active configuration authority
 - catalogue changes do not alter historical transactions
 
 ### Outputs
@@ -536,6 +537,8 @@ Observed opening/start, received, returned, used for fluid, used for filtration,
 - usage categories create transactions
 - `exclude from print` affects report visibility, not ledger
 - chemical weight calculation exposes SG/pack basis and unavailable status where basis is missing
+- opening stock uses positive append-only lines, explicit units/dates, frozen product/price context,
+  and exact-opposite reversal postings; unavailable price remains null rather than becoming zero
 
 ### Outputs
 

@@ -728,16 +728,22 @@ Append-only posting header:
 - id
 - organisation_id
 - project_id
-- daily_report_id
-- source_revision_id
-- posting_type
+- daily_report_id nullable for project-level opening stock
+- source_revision_id nullable for project-level opening stock
+- source_configuration_snapshot_id
+- posting_type: opening_stock / reversal in this slice
+- posting_date
 - source_entity_type/id
 - transaction_group_id nullable
-- status: posted / reversed
+- status: building / posted (`building` is transaction-local and never commits)
 - posted_at/by
-- reversal_of_posting_id nullable
+- reversal_of_posting_id nullable and unique
 - reason nullable
 - idempotency_record_id
+
+The repository inserts a `building` header, inserts every line, then performs the only permitted
+header transition to `posted` before commit. Posted headers cannot update/delete. Original postings
+remain unchanged when a linked reversal is added.
 
 ### inventory_ledger_lines
 
@@ -753,12 +759,23 @@ Append-only posting header:
 - canonical_unit_code
 - applied_unit_price nullable
 - price_basis_unit_code nullable
+- price_effective_from/to nullable
 - currency nullable
-- posted_line_amount nullable
+- currency_minor_unit_scale nullable
+- posted_line_amount numeric(30,12) nullable
+- price_status: ready / unavailable
 - counterparty_project_id nullable
 - metadata_json
 
 Positive canonical quantity increases stock; negative quantity decreases stock. A reversal line copies and negates the original canonical quantity and posted line amount.
+Lines freeze package size/content unit and relevant display labels in metadata. Price fields are all
+present when status is `ready` and all null when `unavailable`. Lines may insert only while the
+parent header is `building`; update/delete is prohibited.
+
+The database line guard recomputes product/snapshot lineage, frozen package context, canonical
+conversion, effective price authority, currency scale, and rounded amount. It serializes opening
+occupancy per stable product definition, allowing different products to be opened independently
+while preventing two active openings for the same lineage.
 
 ### inventory_physical_counts
 
@@ -1090,3 +1107,8 @@ Audit events are append-only and protected by RLS/capability rules.
 - units must be dimensionally compatible
 - physical counts/readings remain separate from calculated balances
 - no overlapping active price ranges for the same product/price basis
+- opening-stock header, lines, idempotency record, and audit event commit atomically
+- posted inventory headers and ledger lines cannot update or delete
+- a reversal references one original posting, is unique, and has exact-opposite quantity/amount
+- ledger stable product identity and frozen product/price versions must share posting project and
+  source configuration snapshot

@@ -84,6 +84,11 @@ the server before response or rendering.
 | View approved client report | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Create amendment | By policy | Optional | No | Reviewer | Approver | No | No |
 
+For the inventory-ledger API, the concrete capabilities are `view_inventory` for immutable authority
+and posting reads, and `post_inventory` for opening/reversal mutations. `post_inventory` also permits
+the reads needed to complete that workflow. Database policies resolve these from project membership;
+development access-token claims do not override membership authority.
+
 ## 5. Approval authority
 
 - Submit and approve are separate capabilities.

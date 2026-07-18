@@ -244,6 +244,100 @@ class ProductPrice(TenantMixin, Base):
     )
 
 
+class InventoryPosting(TenantMixin, Base):
+    __tablename__ = "inventory_postings"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    source_configuration_snapshot_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_configuration_snapshots.id"), nullable=False
+    )
+    posting_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="building")
+    posting_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reversal_of_posting_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inventory_postings.id")
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    posted_by: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    posted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint("reversal_of_posting_id", name="uq_inventory_postings_reversal"),
+        CheckConstraint(
+            "posting_type IN ('opening_stock','reversal')", name="ck_inventory_postings_type"
+        ),
+        CheckConstraint("status IN ('building','posted')", name="ck_inventory_postings_status"),
+        CheckConstraint(
+            "(posting_type = 'opening_stock' AND reversal_of_posting_id IS NULL) OR "
+            "(posting_type = 'reversal' AND reversal_of_posting_id IS NOT NULL "
+            "AND reason IS NOT NULL)",
+            name="ck_inventory_postings_reversal_context",
+        ),
+        Index("ix_inventory_postings_project_date", "project_id", "posting_date"),
+    )
+
+
+class InventoryLedgerLine(TenantMixin, Base):
+    __tablename__ = "inventory_ledger_lines"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    posting_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inventory_postings.id"), nullable=False
+    )
+    product_definition_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_product_definitions.id"), nullable=False
+    )
+    configuration_product_version_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_products.id"), nullable=False
+    )
+    product_price_version_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("product_price_history.id")
+    )
+    entered_quantity: Mapped[Decimal] = mapped_column(Numeric(24, 12), nullable=False)
+    entered_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    canonical_signed_quantity: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    canonical_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    price_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    applied_unit_price: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
+    price_basis_unit_code: Mapped[str | None] = mapped_column(String(20))
+    price_effective_from: Mapped[date | None] = mapped_column(Date)
+    price_effective_to: Mapped[date | None] = mapped_column(Date)
+    currency: Mapped[str | None] = mapped_column(String(3))
+    currency_minor_unit_scale: Mapped[int | None] = mapped_column(Integer)
+    posted_line_amount: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    frozen_product_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("posting_id", "product_definition_id", name="uq_inventory_line_product"),
+        CheckConstraint(
+            "price_status IN ('ready','unavailable')", name="ck_inventory_lines_price_status"
+        ),
+        CheckConstraint(
+            "(price_status = 'ready' AND product_price_version_id IS NOT NULL AND "
+            "applied_unit_price IS NOT NULL AND price_basis_unit_code IS NOT NULL AND "
+            "price_effective_from IS NOT NULL AND currency IS NOT NULL AND "
+            "currency_minor_unit_scale IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
+            "(price_status = 'unavailable' AND product_price_version_id IS NULL AND "
+            "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND "
+            "price_effective_from IS NULL AND price_effective_to IS NULL AND currency IS NULL AND "
+            "currency_minor_unit_scale IS NULL AND posted_line_amount IS NULL)",
+            name="ck_inventory_lines_price_completeness",
+        ),
+        CheckConstraint(
+            "entered_unit_code IN ('kg','t','lb','L','m3','gal_us','bbl','each','package')",
+            name="ck_inventory_lines_entered_unit",
+        ),
+        CheckConstraint(
+            "canonical_unit_code IN ('kg','L','each')", name="ck_inventory_lines_canonical_unit"
+        ),
+        Index("ix_inventory_ledger_lines_product", "product_definition_id"),
+    )
+
+
 class ConfigurationSnapshot(TenantMixin, Base):
     __tablename__ = "project_configuration_snapshots"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)

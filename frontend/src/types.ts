@@ -130,3 +130,87 @@ export interface ProjectProduct {
   prices: ProductPrice[];
 }
 
+export interface OpeningStockAuthorityProduct {
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  item_code: string;
+  item_name: string;
+  package_size: string;
+  package_unit_code: PackageContentUnitCode;
+  inventory_unit_code: ProductUnitCode;
+  price: ProductPrice | null;
+  opened_by_posting_id: string | null;
+}
+
+export interface OpeningStockAuthority {
+  project_id: string;
+  posting_date: string;
+  configuration_snapshot_id: string;
+  products: OpeningStockAuthorityProduct[];
+}
+
+export interface InventoryLedgerLine {
+  id: string;
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  product_price_version_id: string | null;
+  entered_quantity: string;
+  entered_unit_code: ProductUnitCode;
+  canonical_signed_quantity: string;
+  canonical_unit_code: "kg" | "L" | "each";
+  price_status: "ready" | "unavailable";
+  applied_unit_price: string | null;
+  price_basis_unit_code: ProductUnitCode | null;
+  price_effective_from: string | null;
+  price_effective_to: string | null;
+  currency: string | null;
+  currency_minor_unit_scale: number | null;
+  posted_line_amount: string | null;
+  frozen_product: Record<string, unknown>;
+}
+
+export interface OpeningStockPreviewLine {
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  item_code: string;
+  item_name: string;
+  entered_quantity: string;
+  entered_unit_code: ProductUnitCode;
+  package_size: string;
+  package_unit_code: PackageContentUnitCode;
+  canonical_quantity: string;
+  canonical_unit_code: "kg" | "L" | "each";
+  package_count: string;
+  price_status: "ready" | "unavailable";
+  applied_unit_price: string | null;
+  price_basis_unit_code: ProductUnitCode | null;
+  price_effective_from: string | null;
+  price_effective_to: string | null;
+  currency: string | null;
+  currency_minor_unit_scale: number | null;
+  line_amount: string | null;
+}
+
+export interface OpeningStockPreview {
+  project_id: string;
+  posting_date: string;
+  configuration_snapshot_id: string;
+  lines: OpeningStockPreviewLine[];
+  currencies: Record<string, string>;
+}
+
+export interface InventoryPosting {
+  id: string;
+  project_id: string;
+  source_configuration_snapshot_id: string;
+  posting_type: "opening_stock" | "reversal";
+  status: "posted";
+  posting_date: string;
+  reversal_of_posting_id: string | null;
+  reversal_posting_id: string | null;
+  reason: string | null;
+  posted_by: string;
+  posted_at: string;
+  lines: InventoryLedgerLine[];
+}
+
