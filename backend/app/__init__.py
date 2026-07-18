@@ -1,0 +1,1 @@
+"""Vantix FastAPI application package."""
