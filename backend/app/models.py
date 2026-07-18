@@ -64,6 +64,7 @@ class ProjectMembership(TenantMixin, Base):
     user_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id"), primary_key=True
     )
+    role: Mapped[str] = mapped_column(String(50), nullable=False, default="report_editor")
     capabilities: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
 
 

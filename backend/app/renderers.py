@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
 from importlib.metadata import version
 from io import BytesIO
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -28,6 +29,38 @@ class RenderedArtefact:
 
 class RendererUnavailable(RuntimeError):
     pass
+
+
+def filter_payload_visibility(
+    payload: dict[str, Any], visibility: Literal["client", "internal"]
+) -> dict[str, Any]:
+    """Remove internal and restricted nodes server-side for client artefacts."""
+
+    if visibility == "internal":
+        return deepcopy(payload)
+
+    removed = object()
+
+    def filter_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            if value.get("visibility") in {"internal", "restricted"}:
+                return removed
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                filtered = filter_value(item)
+                if filtered is not removed:
+                    result[key] = filtered
+            return result
+        if isinstance(value, list):
+            list_result: list[Any] = []
+            for item in value:
+                filtered = filter_value(item)
+                if filtered is not removed:
+                    list_result.append(filtered)
+            return list_result
+        return deepcopy(value)
+
+    return cast(dict[str, Any], filter_value(payload))
 
 
 def _binary_checksum(content: bytes) -> str:
