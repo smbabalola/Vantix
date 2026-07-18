@@ -1,0 +1,132 @@
+{
+  "name": "Vantix Documentation Baseline v2",
+  "version": "2.1",
+  "generated_date": "2026-07-18",
+  "files": [
+    {
+      "path": ".qodo/agents/agents.md",
+      "bytes": 4830,
+      "sha256": "0f2cdf53a426f0a1b1dca000988ab47a6b926f666db6bdde9579eaef2f4b1519"
+    },
+    {
+      "path": "AGENTS.md",
+      "bytes": 4830,
+      "sha256": "0f2cdf53a426f0a1b1dca000988ab47a6b926f666db6bdde9579eaef2f4b1519"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3425,
+      "sha256": "8bd429e51331a4501d7fd68c3c6cc24fffd63f3890b9f205b3b2e1d2b000e457"
+    },
+    {
+      "path": "contracts/daily-report-envelope.md",
+      "bytes": 2201,
+      "sha256": "8553a84e211e7c3488288748a0db80bbf48bbbeb11b9323a8cbdcbd6c0319b75"
+    },
+    {
+      "path": "contracts/project-snapshot.md",
+      "bytes": 1065,
+      "sha256": "087d407adfe3d48c6b6227735a0a4cf9e116234759d78f8f2e155ca95ebc719f"
+    },
+    {
+      "path": "docs/00-vantix-master-app-document.md",
+      "bytes": 6741,
+      "sha256": "479f71d3a0d4192f4c9fe4f86d33d990509a55d90180fb1b464d195e4f7714e9"
+    },
+    {
+      "path": "docs/01-product-requirements.md",
+      "bytes": 3991,
+      "sha256": "fa72132030b97c5809f4278d4426d60d7d6dab7802f4947d162ce6363534f359"
+    },
+    {
+      "path": "docs/02-technical-requirements.md",
+      "bytes": 7757,
+      "sha256": "d7fa399f35d063c764e351cdc840b8d22583bcdad165274af00481ee2dcd5d0a"
+    },
+    {
+      "path": "docs/03-app-flow.md",
+      "bytes": 7636,
+      "sha256": "54a20d8a4c49b136009e6d7de7ec7f48bd975997b3f26eb284a2bac13d243745"
+    },
+    {
+      "path": "docs/04-ui-ux-design-brief.md",
+      "bytes": 5950,
+      "sha256": "90f672510492629212cc3f5f2da85b9c43ec9e5ba5b0daf168d55b2d3e8cf58d"
+    },
+    {
+      "path": "docs/05-backend-schema.md",
+      "bytes": 19137,
+      "sha256": "3f003d7a5994c7634da853b8fd0617278be3234cffce5540488ec4a38d1152ef"
+    },
+    {
+      "path": "docs/06-implementation-plan.md",
+      "bytes": 4318,
+      "sha256": "eaaf4752c3acc86f2f16258a3a9922408668565aec429fc56551b75d23d28b94"
+    },
+    {
+      "path": "docs/07-module-specifications.md",
+      "bytes": 16768,
+      "sha256": "cef44679b173e01a715fca65996883b50643b10c43bdc061bb9f7bcc68dfb93f"
+    },
+    {
+      "path": "docs/08-reporting-contract.md",
+      "bytes": 4117,
+      "sha256": "c4ff2cbcb728f98ca61cb867f4366bbab87dde15ef5ab4c39ad8ea0ee222e930"
+    },
+    {
+      "path": "docs/09-source-screen-inventory.md",
+      "bytes": 5267,
+      "sha256": "73816944eac6dcc84c86dc3881050241ec5ea397b39fa069b3cb23d4136b77ce"
+    },
+    {
+      "path": "docs/10-qa-and-acceptance.md",
+      "bytes": 10356,
+      "sha256": "31419a75cbbea84aced8c0cd5d8aae19af33edca1d92f94b4f4889bd2263119f"
+    },
+    {
+      "path": "docs/11-migration-and-integrations.md",
+      "bytes": 3858,
+      "sha256": "7952a98ac1916d205b379b5d8346eaf682a0e5d1248d2ccb572d06497570788b"
+    },
+    {
+      "path": "docs/12-mvp-baseline.md",
+      "bytes": 5059,
+      "sha256": "f4203fc68d72a947fcdbe75d95bff09cb223a90eb7e2b8eda4fef61ed576d0e9"
+    },
+    {
+      "path": "docs/13-auth-tenancy-permissions.md",
+      "bytes": 5037,
+      "sha256": "9c4420de1582f8718e63d7db82411462f6efd18d7bfc35face9d9d2c6f7168ed"
+    },
+    {
+      "path": "docs/14-reconciliation-contracts.md",
+      "bytes": 6523,
+      "sha256": "b4fc8f3765c935962985a97e324955432a2c00333534297bc6f6cb6ef2fe8310"
+    },
+    {
+      "path": "docs/15-report-determinism.md",
+      "bytes": 5782,
+      "sha256": "ceb0fad1579625f5238e94bafae6e19734d99e0f6ac157171740cc2fa09c3d04"
+    },
+    {
+      "path": "docs/16-offline-and-conflict-contract.md",
+      "bytes": 4605,
+      "sha256": "c08516cc4b9f53de9aa89a405f59ea662a042c6e94924d8a3df30b31c5be6142"
+    },
+    {
+      "path": "docs/17-api-contracts.md",
+      "bytes": 7272,
+      "sha256": "4ca4462f2784e2dc44166a2a2bf6939193820e9b314d67181baeeb99e542c439"
+    },
+    {
+      "path": "docs/18-mvp-requirement-traceability.md",
+      "bytes": 5299,
+      "sha256": "9bd155026ded202c6b703978aba5c54ef8f96951920c6d8b9ef0dd597ded9113"
+    },
+    {
+      "path": "scripts/validate_documentation.py",
+      "bytes": 1688,
+      "sha256": "cff3acb187b2b77f79f7914f192e87c16ad309d3af48c19d53e236d902b048ba"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      VANTIX_DATABASE_URL: postgresql+psycopg://vantix:vantix@postgres:5432/vantix
+      VANTIX_ENVIRONMENT: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: vantix
+      POSTGRES_USER: vantix
+      POSTGRES_PASSWORD: vantix
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vantix -d vantix"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - vantix-postgres:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: vantix
+      MINIO_ROOT_PASSWORD: change-me-now
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - vantix-objects:/data
+
+volumes:
+  vantix-postgres:
+  vantix-objects:
