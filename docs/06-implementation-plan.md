@@ -76,6 +76,10 @@ Acceptance: VTX-DAY-001 to VTX-DAY-010; VTX-COM-001 to VTX-COM-004; VTX-OFF-001 
 
 - product setup and effective price authority are delivered first as a configuration-only vertical slice
 - transfer, inventory, opening-stock, and cost work starts only after that authority is stable
+- opening-stock V1 is the next bounded slice: project-level immutable posting, package conversion,
+  frozen cost or unavailable price, idempotency, exact reversal, RLS, audit, and grid
+- receipts, transfers, consumption, adjustments, physical counts, balances, reconciliation, cost
+  variance, and inter-project movement remain outside opening-stock V1
 - product setup
 - effective price history
 - draft transfer tickets

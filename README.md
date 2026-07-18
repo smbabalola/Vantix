@@ -39,6 +39,15 @@ The project-products/pricing slice adds:
 - a responsive product/pricing grid with deliberate effective dates, field errors, and unsaved-work gating
 - no inventory posting or balance behaviour
 
+The inventory-ledger/opening-stock slice adds:
+
+- atomic append-only opening postings with stable product lineage and frozen product versions
+- explicit entered and canonical quantities with package-to-content conversion
+- effective-date price lookup with frozen price, currency, basis, and rounded line amount
+- honest unavailable-price postings whose monetary fields remain null rather than zero
+- idempotent posting, exact immutable reversals, audit events, and tenant/project RLS
+- a practical opening-stock workspace with explicit units and immutable posting history
+
 PostgreSQL is the default runtime repository. The in-memory adapter remains only as an explicit
 test dependency override. Submission readiness, version checking, state transition, frozen
 payload, checksum, idempotency record, and audit events are committed in one database transaction.
@@ -89,5 +98,5 @@ be `NOSUPERUSER NOBYPASSRLS` and have normal schema, table, sequence, and functi
   object-storage upload and authorised download-link delivery are not implemented.
 - Draft caching is local-only; background synchronisation and broader offline operation remain out
   of MVP scope.
-- Project products and effective-price configuration are implemented. Inventory postings, opening
-  stock, movements, balances, reconciliation, pits/volumes, and fluid checks remain deferred.
+- Opening-stock postings are implemented. Receipts, transfers, consumption, adjustments, physical
+  counts, balances, cost reconciliation, pits/volumes, and fluid checks remain deferred.

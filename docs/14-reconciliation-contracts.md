@@ -58,6 +58,12 @@ daily_calculated_closing = opening_snapshot
 
 `opening_snapshot` equals the prior approved day's calculated closing, or an approved opening-balance transaction for the first day. It is not a manually editable substitute for the ledger.
 
+Opening-stock V1 is a project-level posting bound to the active configuration snapshot. It uses an
+explicit posting date, stable product lineage, frozen product/price version context, and the
+conversion/cost rules in `contracts/inventory-ledger-opening-stock-v1.md`. An unavailable effective
+price never blocks quantity authority and never becomes zero cost; price and amount remain null with
+status `unavailable`.
+
 ```text
 inventory_variance = physical_closing_count - calculated_closing
 ```
@@ -135,6 +141,8 @@ Tolerance is configuration data with value, unit, effective date, and approver. 
 - Monetary line amount is calculated at posting and rounded `ROUND_HALF_UP` to currency minor units.
 - Daily cost totals sum posted line amounts; they do not re-multiply display-rounded quantities.
 - Reversal copies and negates the original monetary line amount.
+- Package quantities convert through frozen package size/content unit. Price per package derives
+  package count from that same frozen content; content-unit prices convert from canonical quantity.
 
 ## 6. Concurrency
 
