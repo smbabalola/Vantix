@@ -1618,7 +1618,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_inventory_opening_stock"
+            "0008_inventory_authority_precision"
         )
         flags = connection.execute(
             text(
@@ -1630,6 +1630,119 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
         ).one()
         assert flags == (True, True)
     engine.dispose()
+
+
+def test_vtx_mvp_001_upgrade_from_merged_0007_installs_inventory_runtime_guards() -> None:
+    migration_environment = {
+        **os.environ,
+        "VANTIX_DATABASE_URL": os.environ["VANTIX_ADMIN_DATABASE_URL"],
+    }
+
+    def migrate(*arguments: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", *arguments],
+            check=True,
+            cwd=os.getcwd(),
+            env=migration_environment,
+            capture_output=True,
+            text=True,
+        )
+
+    migrate("downgrade", "0007_inventory_opening_stock")
+    try:
+        admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+        with admin.connect() as connection:
+            old_posting_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_posting()'::regprocedure)")
+            )
+            old_line_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_line()'::regprocedure)")
+            )
+            assert "opening stock requires the current configuration snapshot" not in str(
+                old_posting_guard
+            )
+            assert "round(expected_canonical, 12)" not in str(old_line_guard)
+
+        repository = PostgresFoundationRepository()
+        auth = context()
+        project = prepare_project(repository, auth)
+        first = create_configuration(repository, auth, project.id, valid_configuration())
+        active_v1 = activate_configuration(
+            repository, auth, project.id, first.id, "upgrade-path-v1"
+        )
+        assert active_v1.snapshot_id is not None
+        authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+        original = repository.post_opening_stock(
+            auth,
+            project.id,
+            OpeningStockCreate(
+                expected_configuration_snapshot_id=active_v1.snapshot_id,
+                posting_date="2026-07-18",
+                lines=[
+                    OpeningStockLineCreate(
+                        product_definition_id=authority.products[0].product_definition_id,
+                        entered_quantity="1",
+                        entered_unit_code="package",
+                    )
+                ],
+            ),
+            "upgrade-path-opening",
+        )
+        second = create_configuration(
+            repository, auth, project.id, ConfigurationCreate(copy_active=True), "upgrade-path-v2"
+        )
+        active_v2 = activate_configuration(
+            repository, auth, project.id, second.id, "upgrade-path-activate-v2"
+        )
+        assert active_v2.snapshot_id is not None
+
+        migrate("upgrade", "0008_inventory_authority_precision")
+        with admin.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0008_inventory_authority_precision"
+            )
+            posting_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_posting()'::regprocedure)")
+            )
+            line_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_line()'::regprocedure)")
+            )
+            assert "opening stock requires the current configuration snapshot" in str(posting_guard)
+            assert "round(expected_canonical, 12)" in str(line_guard)
+
+        with pytest.raises(DBAPIError), admin.begin() as connection:
+            connection.execute(
+                insert(InventoryPosting).values(
+                    id=uuid4(),
+                    organisation_id=auth.organisation_id,
+                    project_id=project.id,
+                    source_configuration_snapshot_id=active_v1.snapshot_id,
+                    posting_type="opening_stock",
+                    status="building",
+                    posting_date=date(2026, 7, 18),
+                    reversal_of_posting_id=None,
+                    reason=None,
+                    posted_by=auth.user_id,
+                )
+            )
+        with pytest.raises(DBAPIError), admin.begin() as connection:
+            connection.execute(
+                insert(InventoryPosting).values(
+                    id=uuid4(),
+                    organisation_id=auth.organisation_id,
+                    project_id=project.id,
+                    source_configuration_snapshot_id=active_v2.snapshot_id,
+                    posting_type="reversal",
+                    status="building",
+                    posting_date=date(2026, 7, 19),
+                    reversal_of_posting_id=original.id,
+                    reason="Wrong snapshot after upgrade",
+                    posted_by=auth.user_id,
+                )
+            )
+        admin.dispose()
+    finally:
+        migrate("upgrade", "head")
 
 
 def test_vtx_mvp_001_alembic_metadata_has_no_schema_drift() -> None:

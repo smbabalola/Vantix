@@ -164,8 +164,7 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE FUNCTION vantix_guard_inventory_posting() RETURNS trigger LANGUAGE plpgsql AS $$
-        DECLARE source_project uuid; source_org uuid; current_snapshot uuid;
-          original inventory_postings%ROWTYPE;
+        DECLARE source_project uuid; source_org uuid; original inventory_postings%ROWTYPE;
         BEGIN
           IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'posted inventory is append-only'; END IF;
           IF TG_OP = 'UPDATE' THEN
@@ -176,30 +175,21 @@ def upgrade() -> None:
                AND OLD.posting_type = NEW.posting_type AND OLD.posting_date = NEW.posting_date
                AND OLD.reversal_of_posting_id IS NOT DISTINCT FROM NEW.reversal_of_posting_id
                AND OLD.reason IS NOT DISTINCT FROM NEW.reason AND OLD.posted_by = NEW.posted_by THEN
-              NULL;
-            ELSE
-              RAISE EXCEPTION 'posted inventory is append-only';
+              RETURN NEW;
             END IF;
+            RAISE EXCEPTION 'posted inventory is append-only';
           END IF;
           SELECT project_id, organisation_id INTO source_project, source_org
             FROM project_configuration_snapshots WHERE id = NEW.source_configuration_snapshot_id;
           IF source_project IS DISTINCT FROM NEW.project_id OR source_org IS DISTINCT FROM NEW.organisation_id THEN
             RAISE EXCEPTION 'inventory snapshot ownership mismatch';
           END IF;
-          SELECT current_configuration_snapshot_id INTO current_snapshot
-            FROM projects WHERE id = NEW.project_id AND organisation_id = NEW.organisation_id
-            FOR UPDATE;
           PERFORM pg_advisory_xact_lock(hashtextextended(NEW.project_id::text, 0));
-          IF NEW.posting_type = 'opening_stock' THEN
-            IF NEW.source_configuration_snapshot_id IS DISTINCT FROM current_snapshot THEN
-              RAISE EXCEPTION 'opening stock requires the current configuration snapshot';
-            END IF;
-          ELSE
+          IF NEW.posting_type = 'reversal' THEN
             SELECT * INTO original FROM inventory_postings WHERE id = NEW.reversal_of_posting_id;
             IF NOT FOUND OR original.project_id <> NEW.project_id OR original.organisation_id <> NEW.organisation_id
                OR original.posting_type <> 'opening_stock' OR original.status <> 'posted'
-               OR NEW.posting_date < original.posting_date
-               OR NEW.source_configuration_snapshot_id <> original.source_configuration_snapshot_id THEN
+               OR NEW.posting_date < original.posting_date THEN
               RAISE EXCEPTION 'invalid inventory reversal target';
             END IF;
           END IF;
@@ -281,7 +271,6 @@ def upgrade() -> None:
           expected_canonical := CASE WHEN NEW.entered_unit_code = 'package'
             THEN NEW.entered_quantity * product.package_size * package_factor
             ELSE NEW.entered_quantity * entered_factor END;
-          expected_canonical := round(expected_canonical, 12);
           IF NEW.canonical_signed_quantity <> expected_canonical
              OR NEW.canonical_unit_code <> (CASE package_dimension
                WHEN 'mass' THEN 'kg' WHEN 'volume' THEN 'L' ELSE 'each' END) THEN
