@@ -71,6 +71,11 @@ not project-wide.
 The database header guard independently locks the project and requires an opening header to use its
 current snapshot; reversal headers must retain the original posting's snapshot.
 
+Supplier-receipt V1 uses the same positive signed-ledger, current-snapshot, canonical precision,
+append-only, idempotency, and exact-reversal rules. Supplier-document price has precedence over
+configured effective price. When neither exists, cost remains explicitly unavailable. Detailed
+authority is defined in `contracts/inventory-ledger-receipts-v1.md`.
+
 ```text
 inventory_variance = physical_closing_count - calculated_closing
 ```
@@ -78,6 +83,8 @@ inventory_variance = physical_closing_count - calculated_closing
 ### Inventory atomicity
 
 - A posted receipt writes ticket status, ticket lines, ledger lines, applied prices, and audit event in one transaction.
+- V1 receipt posting writes its documentary header directly with the ledger posting; no mutable
+  server ticket draft is persisted.
 - An inter-project transfer writes outbound and inbound groups with one transfer group ID. Both commit or neither commits.
 - Unit conversion is validated before posting.
 - Applied price is selected by effective date before posting and copied to the posted line.

@@ -117,6 +117,12 @@ Pure functions and services:
 - **VTX-TRF-004**: duplicate ticket warning works.
 - **VTX-TRF-005**: posted ticket correction reverses/replaces.
 - **VTX-TRF-006**: idempotent retry does not double-post.
+- **VTX-TRF-007**: delivery note identity is unique within normalized project/supplier scope.
+- **VTX-TRF-008**: entered supplier-document price takes precedence over configured price.
+- **VTX-TRF-009**: absent supplier and configured price posts explicit unavailable cost, not zero.
+- **VTX-TRF-010**: receipt preview and posting use the same current snapshot and calculations.
+- **VTX-TRF-011**: database guards reject forged receipt snapshot, product, conversion, and cost.
+- **VTX-TRF-012**: receipt history retains immutable documentary, batch, date, and cost authority.
 - **VTX-INV-001**: calculated closing follows ledger formula.
 - **VTX-INV-002**: physical closing remains separate.
 - **VTX-INV-003**: variance is visible.

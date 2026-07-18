@@ -253,8 +253,30 @@ audit commit atomically. Same-key/same-request returns the original result; diff
 
 ### `GET /projects/{project_id}/inventory-postings`
 
-Online, `view_inventory` or `post_inventory`. Returns immutable opening/reversal history with frozen
-line authority. It does not calculate balances in this slice.
+Online, `view_inventory` or `post_inventory`. Returns immutable opening, receipt, and reversal
+history with frozen line and documentary authority. It does not calculate balances in this slice.
+
+### `GET /projects/{project_id}/inventory/receipt-authority?posting_date=YYYY-MM-DD`
+
+Online, `view_inventory` or `post_inventory`. Returns the current configuration snapshot and active
+inventory-applicable product/package authority with configured effective-price fallback. It does not
+invent supplier price or cost.
+
+### `POST /projects/{project_id}/inventory-postings/receipts/preview`
+
+Online, `post_inventory`. Body contains reviewed snapshot ID, explicit posting date, required
+supplier and delivery note, optional PO/invoice references, and one or more receipt lines. A line
+may carry optional batch/manufacture/expiry data and optional supplier unit price/basis/currency.
+Returns server-derived conversion, cost source, configured-price period when applicable, fixed-scale
+amounts, unavailable states, and totals without writing business, idempotency, or audit data.
+
+### `POST /projects/{project_id}/inventory-postings/receipts`
+
+Online, `post_inventory`, and `Idempotency-Key`. Posts the exact preview contract atomically as a
+positive immutable receipt. The authenticated actor is `received_by_user_id`. Supplier-document
+price wins over configured price; absent cost stays unavailable. Changed snapshot returns
+`412 INVENTORY_AUTHORITY_CHANGED`; duplicate normalized supplier/delivery-note identity returns 409;
+same-key/same-request returns the original response.
 
 ### `POST /daily-report-revisions/{revision_id}/transfer-tickets`
 
@@ -271,7 +293,8 @@ Online only, idempotent. Posts ticket and inventory lines atomically.
 ### `POST /inventory-postings/{posting_id}/reverse`
 
 Online, `post_inventory`, and `Idempotency-Key`. Requires explicit reversal date and reason. Creates
-one linked posting with exact-opposite quantities and line amounts without current price lookup.
+one linked posting with exact-opposite quantities and line amounts without current product,
+supplier, package, or price lookup. Receipt reversal retains the original source snapshot.
 
 ### `GET /projects/{project_id}/inventory-balances`
 

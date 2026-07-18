@@ -27,6 +27,7 @@ Every production-MVP requirement must map to acceptance IDs before implementatio
 | MVP-TRF-01 | Draft ticket has no balance effect | VTX-TRF-001, VTX-REC-001 | 14 Reconciliation |
 | MVP-TRF-02 | Ticket posting is atomic and idempotent | VTX-TRF-002, VTX-TRF-003, VTX-TRF-006, VTX-REC-002, VTX-REC-003 | 14 Reconciliation / 17 API |
 | MVP-TRF-03 | Posted correction reverses/replaces | VTX-TRF-005, VTX-REC-004, VTX-REC-005 | 14 Reconciliation |
+| MVP-TRF-04 | Supplier receipt posts positive immutable quantity with unique documentary identity, supplier/configured/unavailable frozen cost authority, current-snapshot preview parity, and exact reversal | VTX-TRF-002 to VTX-TRF-012, VTX-REC-002 to VTX-REC-005, VTX-REC-014, VTX-REC-015, VTX-CST-001, VTX-CST-002 | 14 Reconciliation / 17 API / inventory-ledger-receipts-v1 contract |
 | MVP-INV-01 | Closing stock follows signed ledger equation | VTX-INV-001, VTX-REC-007 | 14 Reconciliation |
 | MVP-INV-02 | Physical count and variance remain separate | VTX-INV-002, VTX-INV-003, VTX-REC-008 | 14 Reconciliation |
 | MVP-INV-03 | Applied price and chemical cost remain historical | VTX-CST-001 to VTX-CST-004, VTX-REC-014, VTX-REC-015 | 14 Reconciliation |

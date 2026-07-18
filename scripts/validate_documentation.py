@@ -15,6 +15,7 @@ REQUIRED = [
     'docs/16-offline-and-conflict-contract.md',
     'docs/17-api-contracts.md',
     'docs/18-mvp-requirement-traceability.md',
+    'contracts/inventory-ledger-receipts-v1.md',
 ]
 
 errors = []

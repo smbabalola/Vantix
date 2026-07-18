@@ -507,6 +507,15 @@ Observed ticket summary with type, ticket number, ordered/received by, ship via,
 - correction uses reversal/replacement
 - duplicate ticket warning by project/counterparty/type
 - attachments optional in MVP but recommended
+- supplier receipts require project-scoped supplier/delivery-note identity, explicit posting date,
+  current reviewed configuration snapshot, stable product lineage, and frozen product/package data
+- authenticated posting actor is the V1 received-by user
+- supplier-document price takes precedence over configured effective price; missing cost is
+  unavailable and never zero
+- canonical receipt quantity uses the shared 12-decimal ledger rule; preview and posting use the
+  same server calculation
+- receipt correction is one exact reversal retaining original snapshot, batch/date, and cost source
+- freight allocation, PO workflow, AP matching, and inventory valuation methods remain outside V1
 
 ### Outputs
 
@@ -514,7 +523,7 @@ Transfer log and inventory movements.
 
 ### Acceptance IDs
 
-VTX-TRF-001 to VTX-TRF-006.
+VTX-TRF-001 to VTX-TRF-012.
 
 ---
 

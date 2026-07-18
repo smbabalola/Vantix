@@ -731,7 +731,7 @@ Append-only posting header:
 - daily_report_id nullable for project-level opening stock
 - source_revision_id nullable for project-level opening stock
 - source_configuration_snapshot_id
-- posting_type: opening_stock / reversal in this slice
+- posting_type: opening_stock / receipt / reversal
 - posting_date
 - source_entity_type/id
 - transaction_group_id nullable
@@ -740,10 +740,20 @@ Append-only posting header:
 - reversal_of_posting_id nullable and unique
 - reason nullable
 - idempotency_record_id
+- supplier_name nullable except receipt
+- supplier_name_normalized nullable except receipt
+- delivery_note_number nullable except receipt
+- delivery_note_normalized nullable except receipt
+- purchase_order_reference nullable
+- invoice_reference nullable
+- received_by_user_id nullable except receipt
 
 The repository inserts a `building` header, inserts every line, then performs the only permitted
 header transition to `posted` before commit. Posted headers cannot update/delete. Original postings
 remain unchanged when a linked reversal is added.
+
+Receipt documentary identity is immutable and unique by project plus normalized supplier and
+delivery-note values. A reversal does not release that identity.
 
 ### inventory_ledger_lines
 
@@ -753,6 +763,8 @@ remain unchanged when a linked reversal is added.
 - project_product_version_id (frozen configuration context)
 - product_price_version_id nullable
 - batch_number nullable
+- manufacture_date nullable
+- expiry_date nullable
 - entered_quantity
 - entered_unit_code
 - canonical_signed_quantity
@@ -764,6 +776,7 @@ remain unchanged when a linked reversal is added.
 - currency_minor_unit_scale nullable
 - posted_line_amount numeric(30,12) nullable
 - price_status: ready / unavailable
+- cost_source: supplier_document / configured_effective_price / unavailable
 - counterparty_project_id nullable
 - metadata_json
 
@@ -781,6 +794,13 @@ occupancy per stable product definition, allowing different products to be opene
 while preventing two active openings for the same lineage.
 The header guard binds opening stock to the project's current active snapshot and reversals to the
 original posting's snapshot, including when a raw-SQL building header is transitioned to posted.
+
+Receipt lines allow priced supplier authority without a configured price ID. Supplier-document
+price, basis, project currency, scale, and amount are frozen; configured fallback retains price ID
+and effective period. The database recomputes cost-source completeness, configured/supplier price
+precedence, batch/date validity, conversion, and line amount. Receipt and reversal snapshot guards,
+document uniqueness, RLS, immutability, and exact reversal are introduced only through a new
+migration after `0008_inventory_authority_precision`.
 
 ### inventory_physical_counts
 
