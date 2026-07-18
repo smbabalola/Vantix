@@ -8,14 +8,20 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
-from vantix_core.lifecycle import ConfigurationSnapshot as CoreConfigurationSnapshot
+from vantix_core.project_configuration import (
+    ConfigurationActivationError,
+    build_project_snapshot,
+    guard_configuration_activation,
+    validate_project_configuration,
+)
 from vantix_core.readiness import validate_foundation_readiness
 
 from .auth import AuthContext, Capability
@@ -39,6 +45,8 @@ from .models import (
 from .renderers import filter_payload_visibility, render_report
 from .schemas import (
     ConfigurationCreate,
+    ConfigurationPatch,
+    ConfigurationReadinessView,
     ConfigurationView,
     DailyReportCreate,
     DecisionRequest,
@@ -215,6 +223,66 @@ class PostgresFoundationRepository:
         )
 
     @staticmethod
+    def _project_view(project: Project) -> ProjectView:
+        return ProjectView(
+            id=project.id,
+            organisation_id=project.organisation_id,
+            project_code=project.project_code,
+            project_name=project.project_name,
+            well_name=project.well_name,
+            operator_name=project.operator_name,
+            client_name=project.client_name,
+            rig_name=project.rig_name,
+            location_text=project.location_text,
+            time_zone=project.time_zone,
+            currency=project.currency,
+            unit_set=cast(Any, project.unit_set),
+            reporting_start_date=project.reporting_start_date,
+            status=project.status,
+            row_version=project.row_version,
+            current_configuration_version_id=project.current_configuration_version_id,
+            active_configuration_snapshot_id=project.current_configuration_snapshot_id,
+        )
+
+    @staticmethod
+    def _project_configuration_data(project: Project) -> dict[str, Any]:
+        return {
+            "project_code": project.project_code,
+            "project_name": project.project_name,
+            "well_name": project.well_name,
+            "operator_name": project.operator_name,
+            "client_name": project.client_name,
+            "rig_name": project.rig_name,
+            "location_text": project.location_text,
+            "time_zone": project.time_zone,
+            "currency": project.currency,
+            "unit_set": project.unit_set,
+        }
+
+    @staticmethod
+    def _configuration_view(
+        session: Session, configuration: ConfigurationVersion
+    ) -> ConfigurationView:
+        snapshot = session.scalar(
+            select(ConfigurationSnapshot).where(
+                ConfigurationSnapshot.configuration_version_id == configuration.id
+            )
+        )
+        return ConfigurationView(
+            id=configuration.id,
+            project_id=configuration.project_id,
+            version=configuration.version_number,
+            state=cast(Any, configuration.state),
+            row_version=configuration.row_version,
+            data=deepcopy(configuration.data),
+            change_summary=configuration.change_summary,
+            activated_by=configuration.activated_by,
+            activated_at=configuration.activated_at,
+            snapshot_id=snapshot.id if snapshot else None,
+            checksum=snapshot.canonical_checksum if snapshot else None,
+        )
+
+    @staticmethod
     def _lock_idempotency(
         session: Session,
         auth: AuthContext,
@@ -352,28 +420,70 @@ class PostgresFoundationRepository:
                 before=None,
                 after=body.model_dump(mode="json"),
             )
-            return ProjectView(
-                id=project_id,
-                organisation_id=auth.organisation_id,
-                **body.model_dump(),
-            )
+            return self._project_view(project)
+
+    def list_projects(self, auth: AuthContext) -> list[ProjectView]:
+        with self._transaction(auth) as session:
+            projects = session.scalars(select(Project).order_by(Project.project_code)).all()
+            return [self._project_view(project) for project in projects]
+
+    def get_project(self, auth: AuthContext, project_id: UUID) -> ProjectView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            return self._project_view(self._project(session, auth, project_id))
 
     def create_configuration(
-        self, auth: AuthContext, project_id: UUID, body: ConfigurationCreate
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        body: ConfigurationCreate,
+        idempotency_key: str,
     ) -> ConfigurationView:
+        request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+        request_hash = _request_hash(request)
         with self._transaction(auth, project_ids=(project_id,)) as session:
-            self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
-            last_version = session.scalar(
-                select(func.max(ConfigurationVersion.version_number)).where(
-                    ConfigurationVersion.project_id == project_id
-                )
+            project = session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
             )
+            if project is None or project.organisation_id != auth.organisation_id:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_NOT_FOUND")
+            if Capability.CONFIGURE_PROJECT not in self._database_capabilities(
+                session, auth, project_id
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "create_configuration", idempotency_key, request_hash
+            )
+            if existing:
+                return ConfigurationView.model_validate(existing.response_json)
+            latest = session.scalar(
+                select(ConfigurationVersion)
+                .where(ConfigurationVersion.project_id == project_id)
+                .order_by(ConfigurationVersion.version_number.desc())
+                .limit(1)
+            )
+            if latest is not None and latest.state == "draft":
+                raise _error(
+                    status.HTTP_409_CONFLICT,
+                    "CONFIGURATION_DRAFT_EXISTS",
+                    "Update the existing draft before creating another revision.",
+                )
+            active = None
+            if project.current_configuration_version_id:
+                active = session.get(ConfigurationVersion, project.current_configuration_version_id)
+            if body.data is not None:
+                data = body.data.model_dump(mode="json", exclude_none=True)
+            elif body.copy_active and active is not None:
+                data = deepcopy(active.data)
+            else:
+                data = {"default_interval_id": None, "intervals": []}
             configuration = ConfigurationVersion(
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
-                version_number=(last_version or 0) + 1,
+                version_number=(latest.version_number if latest else 0) + 1,
                 state="draft",
-                data=deepcopy(body.data),
+                data=data,
+                change_summary=body.change_summary,
+                created_by=auth.user_id,
             )
             session.add(configuration)
             session.flush()
@@ -387,30 +497,54 @@ class PostgresFoundationRepository:
                 before=None,
                 after={"version": configuration.version_number, "state": "draft"},
             )
-            return ConfigurationView(
-                id=configuration.id,
-                project_id=project_id,
-                version=configuration.version_number,
-                state="draft",
-                data=deepcopy(configuration.data),
+            view = self._configuration_view(session, configuration)
+            self._remember_idempotency(
+                session,
+                auth,
+                "create_configuration",
+                idempotency_key,
+                request_hash,
+                "project_configuration_version",
+                configuration.id,
+                view,
+                response_status=201,
             )
+            return view
 
-    def activate_configuration(
+    def list_configurations(self, auth: AuthContext, project_id: UUID) -> list[ConfigurationView]:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+            configurations = session.scalars(
+                select(ConfigurationVersion)
+                .where(ConfigurationVersion.project_id == project_id)
+                .order_by(ConfigurationVersion.version_number.desc())
+            ).all()
+            return [self._configuration_view(session, item) for item in configurations]
+
+    def get_configuration(
+        self, auth: AuthContext, project_id: UUID, version_id: UUID
+    ) -> ConfigurationView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+            configuration = session.scalar(
+                select(ConfigurationVersion).where(
+                    ConfigurationVersion.id == version_id,
+                    ConfigurationVersion.project_id == project_id,
+                )
+            )
+            if configuration is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+            return self._configuration_view(session, configuration)
+
+    def patch_configuration(
         self,
         auth: AuthContext,
         project_id: UUID,
         version_id: UUID,
-        idempotency_key: str,
+        body: ConfigurationPatch,
     ) -> ConfigurationView:
-        request = {"project_id": str(project_id), "version_id": str(version_id)}
-        request_hash = _request_hash(request)
         with self._transaction(auth, project_ids=(project_id,)) as session:
-            existing = self._lock_idempotency(
-                session, auth, "activate_configuration", idempotency_key, request_hash
-            )
-            if existing:
-                return ConfigurationView.model_validate(existing.response_json)
-            project = self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+            self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
             configuration = session.scalar(
                 select(ConfigurationVersion)
                 .where(
@@ -421,30 +555,173 @@ class PostgresFoundationRepository:
             )
             if configuration is None:
                 raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
-            core_snapshot = CoreConfigurationSnapshot.create(
-                project_id, configuration.version_number, configuration.data
+            if configuration.state != "draft":
+                raise _error(status.HTTP_423_LOCKED, "CONFIGURATION_LOCKED")
+            if configuration.row_version != body.expected_version:
+                raise _error(status.HTTP_412_PRECONDITION_FAILED, "CONFIGURATION_VERSION_CONFLICT")
+            before = {
+                "data": deepcopy(configuration.data),
+                "row_version": configuration.row_version,
+            }
+            configuration.data = body.data.model_dump(mode="json", exclude_none=True)
+            configuration.change_summary = body.change_summary
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=project_id,
+                entity_type="project_configuration_version",
+                entity_id=configuration.id,
+                action="update_draft",
+                before=before,
+                after={
+                    "data": deepcopy(configuration.data),
+                    "row_version": configuration.row_version,
+                },
+            )
+            return self._configuration_view(session, configuration)
+
+    def validate_configuration(
+        self, auth: AuthContext, project_id: UUID, version_id: UUID
+    ) -> ConfigurationReadinessView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+            configuration = session.scalar(
+                select(ConfigurationVersion).where(
+                    ConfigurationVersion.id == version_id,
+                    ConfigurationVersion.project_id == project_id,
+                )
+            )
+            if configuration is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+            readiness = validate_project_configuration(
+                self._project_configuration_data(project), configuration.data
+            )
+            return ConfigurationReadinessView(
+                state=readiness.state,
+                can_activate=readiness.can_activate,
+                validated_version=configuration.row_version,
+                draft_checksum=payload_checksum(configuration.data),
+                issues=[asdict(issue) for issue in readiness.issues],
+            )
+
+    def activate_configuration(
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        version_id: UUID,
+        idempotency_key: str,
+        expected_version: int,
+        expected_checksum: str,
+    ) -> ConfigurationView:
+        request = {
+            "project_id": str(project_id),
+            "version_id": str(version_id),
+            "expected_version": expected_version,
+            "expected_checksum": expected_checksum,
+        }
+        request_hash = _request_hash(request)
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
+            )
+            if project is None or project.organisation_id != auth.organisation_id:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_NOT_FOUND")
+            if Capability.CONFIGURE_PROJECT not in self._database_capabilities(
+                session, auth, project_id
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "activate_configuration", idempotency_key, request_hash
+            )
+            if existing:
+                return ConfigurationView.model_validate(existing.response_json)
+            configuration = session.scalar(
+                select(ConfigurationVersion)
+                .where(
+                    ConfigurationVersion.id == version_id,
+                    ConfigurationVersion.project_id == project_id,
+                )
+                .with_for_update()
+            )
+            if configuration is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+            latest = session.scalar(
+                select(ConfigurationVersion)
+                .where(ConfigurationVersion.project_id == project_id)
+                .order_by(ConfigurationVersion.version_number.desc())
+                .limit(1)
+            )
+            current = (
+                session.get(ConfigurationVersion, project.current_configuration_version_id)
+                if project.current_configuration_version_id
+                else None
+            )
+            try:
+                guard_configuration_activation(
+                    project=self._project_configuration_data(project),
+                    data=configuration.data,
+                    state=configuration.state,
+                    row_version=configuration.row_version,
+                    expected_version=expected_version,
+                    expected_checksum=expected_checksum,
+                    version_number=configuration.version_number,
+                    latest_version_number=(
+                        latest.version_number
+                        if latest is not None
+                        else configuration.version_number
+                    ),
+                    active_version_number=(current.version_number if current is not None else None),
+                )
+            except ConfigurationActivationError as exc:
+                status_codes = {
+                    "CONFIGURATION_VERSION_CONFLICT": status.HTTP_412_PRECONDITION_FAILED,
+                    "CONFIGURATION_NOT_READY": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                }
+                raise _error(
+                    status_codes.get(exc.code, status.HTTP_409_CONFLICT),
+                    exc.code,
+                    str(exc),
+                ) from exc
+            activated_at = datetime.now(UTC)
+            snapshot_id = uuid4()
+            snapshot_json, checksum = build_project_snapshot(
+                organisation_id=auth.organisation_id,
+                project_id=project_id,
+                project=self._project_configuration_data(project),
+                data=configuration.data,
+                version_id=configuration.id,
+                version_number=configuration.version_number,
+                activated_by=auth.user_id,
+                activated_at=activated_at,
             )
             snapshot = ConfigurationSnapshot(
-                id=core_snapshot.id,
+                id=snapshot_id,
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
                 configuration_version_id=configuration.id,
                 schema_version="1.0",
-                snapshot_json=core_snapshot.payload,
-                canonical_checksum=core_snapshot.checksum,
+                snapshot_json=snapshot_json,
+                canonical_checksum=checksum,
             )
             session.add(snapshot)
+            if project.current_configuration_version_id:
+                previous = session.get(
+                    ConfigurationVersion, project.current_configuration_version_id
+                )
+                if previous is not None and previous.id != configuration.id:
+                    previous.state = "superseded"
+                    session.flush()
             configuration.state = "active"
+            configuration.activated_by = auth.user_id
+            configuration.activated_at = activated_at
+            project.status = "active"
+            project.current_configuration_version_id = configuration.id
             project.current_configuration_snapshot_id = snapshot.id
-            view = ConfigurationView(
-                id=configuration.id,
-                project_id=project_id,
-                version=configuration.version_number,
-                state="active",
-                data=deepcopy(configuration.data),
-                snapshot_id=snapshot.id,
-                checksum=snapshot.canonical_checksum,
-            )
+            project.row_version += 1
+            session.flush()
+            view = self._configuration_view(session, configuration)
             self._audit(
                 session,
                 auth,

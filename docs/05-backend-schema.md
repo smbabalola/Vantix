@@ -122,6 +122,18 @@ Roles:
 - created_by
 - activated_by
 - activated_at
+- row_version for draft optimistic concurrency
+
+Partial unique indexes enforce one draft and one active version per project. Configuration
+snapshots, project current pointers, daily reports, and report revisions use deferred ownership
+constraint triggers so every referenced configuration remains in the same organisation/project.
+Project/report/revision snapshot bindings and configuration ownership identities are immutable.
+
+Foundation V1 stores structured draft configuration in `data` and freezes the canonical activated
+form in `project_configuration_snapshots`. Required V1 groups are project identity/units and basic
+interval context. Products, pits, fluid systems, prices, personnel, equipment, screens, losses,
+formation, and directional groups are added only by their later vertical slices; absent groups are
+not fabricated during activation.
 
 ### project_intervals
 
@@ -143,6 +155,12 @@ Roles:
 - status
 
 Detailed interval fields remain subject to product confirmation.
+
+For foundation V1, `top_md` and `bottom_md` are optional canonical unit-bearing value objects. Units
+are controlled length codes (`m` or `ft`) and must match the authoritative Metric/Field project
+profile. MD is non-negative; if both bounds exist, bottom MD is greater than top MD. Snapshot
+decimal strings are canonicalised. TVD, hole/casing geometry,
+planned dates, and fluid-system binding remain absent unless a later approved slice defines them.
 
 ## 5. Units and catalogue tables
 

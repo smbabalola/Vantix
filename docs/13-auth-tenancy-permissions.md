@@ -33,6 +33,11 @@ SET LOCAL app.is_system_service = 'false';
 
 RLS policies compare row ownership to these values. Database migrations and controlled background workers use a separate role; ordinary application connections cannot bypass RLS.
 
+`app.current_project_ids` is a filtering aid after authority resolution, never authority by itself.
+Project-membership rows use separate policies: ordinary users may select only their own membership;
+inserts, updates, and deletes require an active organisation administrator or operations manager.
+Supplying a project ID in a request cannot disclose or create membership.
+
 ## 3. Roles
 
 ### Organisation roles

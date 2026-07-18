@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -58,12 +59,30 @@ class Project(TenantMixin, Base):
     project_code: Mapped[str] = mapped_column(String(50), nullable=False)
     project_name: Mapped[str] = mapped_column(String(200), nullable=False)
     well_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    operator_name: Mapped[str | None] = mapped_column(String(200))
+    client_name: Mapped[str | None] = mapped_column(String(200))
+    rig_name: Mapped[str | None] = mapped_column(String(200))
+    location_text: Mapped[str | None] = mapped_column(String(500))
     time_zone: Mapped[str] = mapped_column(String(100), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     unit_set: Mapped[str] = mapped_column(String(100), nullable=False)
-    current_configuration_snapshot_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    reporting_start_date: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="draft")
+    current_configuration_version_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_configuration_versions.id", use_alter=True)
+    )
+    current_configuration_snapshot_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_configuration_snapshots.id", use_alter=True)
+    )
     row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    __table_args__ = (UniqueConstraint("organisation_id", "project_code"),)
+    __table_args__ = (
+        UniqueConstraint("organisation_id", "project_code"),
+        CheckConstraint(
+            "status IN ('draft', 'active', 'inactive', 'archived')",
+            name="ck_projects_status",
+        ),
+        CheckConstraint("unit_set IN ('Metric', 'Field')", name="ck_projects_unit_set"),
+    )
 
 
 class ProjectMembership(TenantMixin, Base):
@@ -87,8 +106,31 @@ class ConfigurationVersion(TenantMixin, Base):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String(30), nullable=False, default="draft")
     data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    effective_from: Mapped[date | None] = mapped_column(Date)
+    change_summary: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    activated_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    __table_args__ = (UniqueConstraint("project_id", "version_number"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "version_number"),
+        CheckConstraint(
+            "state IN ('draft', 'active', 'superseded')",
+            name="ck_project_configuration_state",
+        ),
+        Index(
+            "one_active_configuration_per_project",
+            "project_id",
+            unique=True,
+            postgresql_where=state == "active",
+        ),
+        Index(
+            "one_draft_configuration_per_project",
+            "project_id",
+            unique=True,
+            postgresql_where=state == "draft",
+        ),
+    )
 
 
 class ConfigurationSnapshot(TenantMixin, Base):
@@ -98,7 +140,10 @@ class ConfigurationSnapshot(TenantMixin, Base):
         PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
     )
     configuration_version_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("project_configuration_versions.id"), nullable=False
+        PGUUID(as_uuid=True),
+        ForeignKey("project_configuration_versions.id"),
+        unique=True,
+        nullable=False,
     )
     schema_version: Mapped[str] = mapped_column(String(30), nullable=False)
     snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)

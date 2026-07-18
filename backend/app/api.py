@@ -14,13 +14,20 @@ from vantix_core.lifecycle import (
     LifecycleError,
     ReportRevision,
 )
+from vantix_core.project_configuration import (
+    ConfigurationActivationError,
+    guard_configuration_activation,
+)
 
 from .auth import AuthContext, Capability, auth_context
 from .config import get_settings
 from .postgres_repository import PostgresFoundationRepository, postgres_repository
 from .renderers import render_report
 from .schemas import (
+    ConfigurationActivation,
     ConfigurationCreate,
+    ConfigurationPatch,
+    ConfigurationReadinessView,
     ConfigurationView,
     DailyReportCreate,
     DecisionRequest,
@@ -52,6 +59,28 @@ def _project(project_id: UUID, auth: AuthContext, repository: FoundationStore) -
     if not project or project.organisation_id != auth.organisation_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PROJECT_NOT_FOUND"})
     return project
+
+
+def _project_view(project: ProjectRecord) -> ProjectView:
+    return ProjectView(
+        id=project.id,
+        organisation_id=project.organisation_id,
+        project_code=project.project_code,
+        project_name=project.project_name,
+        well_name=project.well_name,
+        operator_name=project.operator_name,
+        client_name=project.client_name,
+        rig_name=project.rig_name,
+        location_text=project.location_text,
+        time_zone=project.time_zone,
+        currency=project.currency,
+        unit_set=cast(Any, project.unit_set),
+        reporting_start_date=project.reporting_start_date,
+        status="active" if project.active_snapshot else "draft",
+        active_configuration_snapshot_id=(
+            project.active_snapshot.id if project.active_snapshot else None
+        ),
+    )
 
 
 def _report(report_id: UUID, auth: AuthContext, repository: FoundationStore) -> DailyReport:
@@ -178,6 +207,32 @@ def create_project(
     return ProjectView(**body.model_dump(), id=record.id, organisation_id=record.organisation_id)
 
 
+@router.get("/projects", response_model=list[ProjectView])
+def list_projects(
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> list[ProjectView]:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.list_projects(auth)
+    return [
+        _project_view(project)
+        for project in repository.projects.values()
+        if project.organisation_id == auth.organisation_id
+    ]
+
+
+@router.get("/projects/{project_id}", response_model=ProjectView)
+def get_project(
+    project_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.get_project(auth, project_id)
+    project = _project(project_id, auth, repository)
+    return _project_view(project)
+
+
 @router.post(
     "/projects/{project_id}/configuration-versions",
     response_model=ConfigurationView,
@@ -188,21 +243,104 @@ def create_configuration(
     body: ConfigurationCreate,
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ConfigurationView:
     if isinstance(repository, PostgresFoundationRepository):
-        return repository.create_configuration(auth, project_id, body)
+        return repository.create_configuration(auth, project_id, body, idempotency_key)
     auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
-    version = len(project.configuration_versions) + 1
-    record = {"id": uuid4(), "version": version, "state": "draft", "data": body.data}
-    project.configuration_versions.append(record)
-    return ConfigurationView(
-        id=cast(UUID, record["id"]),
-        project_id=project.id,
-        version=cast(int, record["version"]),
-        state=cast(Any, record["state"]),
-        data=cast(dict[str, Any], record["data"]),
+    request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+
+    def create() -> ConfigurationView:
+        if any(item["state"] == "draft" for item in project.configuration_versions):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "CONFIGURATION_DRAFT_EXISTS"},
+            )
+        version = len(project.configuration_versions) + 1
+        data = body.data.model_dump(mode="json", exclude_none=True) if body.data else {}
+        record = {
+            "id": uuid4(),
+            "version": version,
+            "state": "draft",
+            "row_version": 1,
+            "data": data,
+        }
+        project.configuration_versions.append(record)
+        return ConfigurationView(
+            id=cast(UUID, record["id"]),
+            project_id=project.id,
+            version=cast(int, record["version"]),
+            state=cast(Any, record["state"]),
+            row_version=1,
+            data=data,
+        )
+
+    return _idempotent(
+        repository,
+        auth,
+        "create_configuration",
+        idempotency_key,
+        request,
+        create,
     )
+
+
+@router.get("/projects/{project_id}/configuration-versions", response_model=list[ConfigurationView])
+def list_configurations(
+    project_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> list[ConfigurationView]:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.list_configurations(auth, project_id)
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail={"code": "POSTGRES_REQUIRED"})
+
+
+@router.get(
+    "/projects/{project_id}/configuration-versions/{version_id}",
+    response_model=ConfigurationView,
+)
+def get_configuration(
+    project_id: UUID,
+    version_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ConfigurationView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.get_configuration(auth, project_id, version_id)
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail={"code": "POSTGRES_REQUIRED"})
+
+
+@router.patch(
+    "/projects/{project_id}/configuration-versions/{version_id}",
+    response_model=ConfigurationView,
+)
+def patch_configuration(
+    project_id: UUID,
+    version_id: UUID,
+    body: ConfigurationPatch,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ConfigurationView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.patch_configuration(auth, project_id, version_id, body)
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail={"code": "POSTGRES_REQUIRED"})
+
+
+@router.post(
+    "/projects/{project_id}/configuration-versions/{version_id}/validate",
+    response_model=ConfigurationReadinessView,
+)
+def validate_configuration(
+    project_id: UUID,
+    version_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ConfigurationReadinessView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.validate_configuration(auth, project_id, version_id)
+    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail={"code": "POSTGRES_REQUIRED"})
 
 
 @router.post(
@@ -212,12 +350,20 @@ def create_configuration(
 def activate_configuration(
     project_id: UUID,
     version_id: UUID,
+    body: ConfigurationActivation,
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ConfigurationView:
     if isinstance(repository, PostgresFoundationRepository):
-        return repository.activate_configuration(auth, project_id, version_id, idempotency_key)
+        return repository.activate_configuration(
+            auth,
+            project_id,
+            version_id,
+            idempotency_key,
+            body.expected_version,
+            body.expected_checksum,
+        )
     auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
     record = next(
@@ -227,18 +373,54 @@ def activate_configuration(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "CONFIGURATION_NOT_FOUND"})
 
     def activate() -> ConfigurationView:
+        try:
+            guard_configuration_activation(
+                project={
+                    "project_code": project.project_code,
+                    "project_name": project.project_name,
+                    "well_name": project.well_name,
+                    "time_zone": project.time_zone,
+                    "currency": project.currency,
+                    "unit_set": project.unit_set,
+                },
+                data=cast(dict[str, Any], record["data"]),
+                state=cast(str, record["state"]),
+                row_version=cast(int, record["row_version"]),
+                expected_version=body.expected_version,
+                expected_checksum=body.expected_checksum,
+                version_number=cast(int, record["version"]),
+                latest_version_number=max(
+                    cast(int, item["version"]) for item in project.configuration_versions
+                ),
+                active_version_number=(
+                    project.active_snapshot.version if project.active_snapshot else None
+                ),
+            )
+        except ConfigurationActivationError as exc:
+            status_codes = {
+                "CONFIGURATION_VERSION_CONFLICT": status.HTTP_412_PRECONDITION_FAILED,
+                "CONFIGURATION_NOT_READY": status.HTTP_422_UNPROCESSABLE_ENTITY,
+            }
+            raise HTTPException(
+                status_codes.get(exc.code, status.HTTP_409_CONFLICT),
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         snapshot = ConfigurationSnapshot.create(
             project.id,
             cast(int, record["version"]),
             cast(dict[str, Any], record["data"]),
         )
-        project.active_snapshot = snapshot
+        for item in project.configuration_versions:
+            if item["state"] == "active":
+                item["state"] = "superseded"
         record["state"] = "active"
+        project.active_snapshot = snapshot
         return ConfigurationView(
             id=cast(UUID, record["id"]),
             project_id=project.id,
             version=cast(int, record["version"]),
             state=cast(Any, record["state"]),
+            row_version=cast(int, record["row_version"]),
             data=cast(dict[str, Any], record["data"]),
             snapshot_id=snapshot.id,
             checksum=snapshot.checksum,
@@ -249,7 +431,11 @@ def activate_configuration(
         auth,
         "activate_configuration",
         idempotency_key,
-        {"project_id": str(project_id), "version_id": str(version_id)},
+        {
+            "project_id": str(project_id),
+            "version_id": str(version_id),
+            **body.model_dump(),
+        },
         activate,
     )
 

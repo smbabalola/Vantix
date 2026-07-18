@@ -1,0 +1,155 @@
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from vantix_core.canonical import payload_checksum
+from vantix_core.project_configuration import (
+    ConfigurationActivationError,
+    build_project_snapshot,
+    guard_configuration_activation,
+    validate_project_configuration,
+)
+
+
+def project_identity() -> dict[str, str]:
+    return {
+        "project_code": "NS-A",
+        "project_name": "North Sea A",
+        "well_name": "A-01",
+        "time_zone": "Europe/London",
+        "currency": "GBP",
+        "unit_set": "Metric",
+    }
+
+
+def configuration() -> dict:
+    interval_id = str(uuid4())
+    return {
+        "default_interval_id": interval_id,
+        "intervals": [
+            {
+                "id": interval_id,
+                "name": "12 1/4 in hole section",
+                "operation_mode": "drilling",
+                "top_md": {"value": "1000", "unit": "m", "provenance": "entered"},
+                "bottom_md": {"value": "1800", "unit": "m", "provenance": "entered"},
+            }
+        ],
+    }
+
+
+def test_vtx_prj_002_ready_basic_configuration_can_activate() -> None:
+    readiness = validate_project_configuration(project_identity(), configuration())
+    assert readiness.can_activate is True
+    assert readiness.issues == ()
+
+
+def test_vtx_prj_002_readiness_identifies_missing_required_groups() -> None:
+    readiness = validate_project_configuration({}, {})
+    assert readiness.can_activate is False
+    assert {issue.code for issue in readiness.issues} >= {
+        "PROJECT_FIELD_REQUIRED",
+        "INTERVAL_REQUIRED",
+        "DEFAULT_INTERVAL_REQUIRED",
+    }
+
+
+def test_vtx_prj_006_source_gap_interval_fields_remain_absent() -> None:
+    data = configuration()
+    data["intervals"][0].pop("top_md")
+    data["intervals"][0].pop("bottom_md")
+    readiness = validate_project_configuration(project_identity(), data)
+    snapshot, _ = build_project_snapshot(
+        organisation_id=uuid4(),
+        project_id=uuid4(),
+        project=project_identity(),
+        data=data,
+        version_id=uuid4(),
+        version_number=1,
+        activated_by=uuid4(),
+        activated_at=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+    assert readiness.can_activate is True
+    assert "top_md" not in snapshot["intervals"][0]
+    assert "bottom_md" not in snapshot["intervals"][0]
+    assert "top_tvd" not in snapshot["intervals"][0]
+
+
+def test_vtx_prj_002_depth_bounds_require_units_and_valid_order() -> None:
+    data = configuration()
+    data["intervals"][0]["bottom_md"] = {
+        "value": "900",
+        "unit": "m",
+        "provenance": "entered",
+    }
+    readiness = validate_project_configuration(project_identity(), data)
+    assert readiness.can_activate is False
+    assert any(issue.code == "INTERVAL_DEPTH_ORDER_INVALID" for issue in readiness.issues)
+
+
+def test_vtx_prj_002_rejects_unsafe_units_negative_md_and_free_text_modes() -> None:
+    data = configuration()
+    data["intervals"][0]["operation_mode"] = "sidetrack-ish"
+    data["intervals"][0]["top_md"] = {
+        "value": "-1",
+        "unit": "metres",
+        "provenance": "entered",
+    }
+    readiness = validate_project_configuration(project_identity(), data)
+    codes = {issue.code for issue in readiness.issues}
+    assert "OPERATION_MODE_UNRECOGNISED" in codes
+    assert "DEPTH_UNIT_UNRECOGNISED" in codes
+
+    data["intervals"][0]["top_md"]["unit"] = "m"
+    readiness = validate_project_configuration(project_identity(), data)
+    assert any(issue.code == "NEGATIVE_MEASURED_DEPTH" for issue in readiness.issues)
+
+
+def test_vtx_prj_003_snapshot_canonicalises_depth_decimals() -> None:
+    data = configuration()
+    data["intervals"][0]["top_md"]["value"] = "01000.5000"
+    snapshot, _ = build_project_snapshot(
+        organisation_id=uuid4(),
+        project_id=uuid4(),
+        project=project_identity(),
+        data=data,
+        version_id=uuid4(),
+        version_number=1,
+        activated_by=uuid4(),
+        activated_at=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+    assert snapshot["intervals"][0]["top_md"] == {
+        "value": "1000.5",
+        "unit": "m",
+        "provenance": "entered",
+    }
+
+
+def test_vtx_prj_003_activation_guard_rejects_stale_and_regressive_versions() -> None:
+    data = configuration()
+    common = {
+        "project": project_identity(),
+        "data": data,
+        "state": "draft",
+        "row_version": 1,
+        "expected_version": 1,
+        "expected_checksum": payload_checksum(data),
+    }
+
+    with pytest.raises(ConfigurationActivationError, match="latest") as not_latest:
+        guard_configuration_activation(
+            **common,
+            version_number=1,
+            latest_version_number=2,
+            active_version_number=2,
+        )
+    assert not_latest.value.code == "CONFIGURATION_NOT_LATEST"
+
+    with pytest.raises(ConfigurationActivationError, match="older") as regression:
+        guard_configuration_activation(
+            **common,
+            version_number=2,
+            latest_version_number=2,
+            active_version_number=2,
+        )
+    assert regression.value.code == "CONFIGURATION_VERSION_REGRESSION"

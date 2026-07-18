@@ -10,6 +10,12 @@ from .lifecycle import (
     RevisionKind,
     RevisionState,
 )
+from .project_configuration import (
+    ConfigurationIssue,
+    ConfigurationReadiness,
+    build_project_snapshot,
+    validate_project_configuration,
+)
 from .readiness import ReadinessIssue, ReadinessResult, validate_foundation_readiness
 
 __all__ = [
@@ -25,4 +31,8 @@ __all__ = [
     "canonical_bytes",
     "payload_checksum",
     "validate_foundation_readiness",
+    "ConfigurationIssue",
+    "ConfigurationReadiness",
+    "build_project_snapshot",
+    "validate_project_configuration",
 ]

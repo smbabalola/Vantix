@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -20,29 +20,81 @@ class ProjectCreate(BaseModel):
     project_code: str = Field(min_length=1, max_length=50)
     project_name: str = Field(min_length=1, max_length=200)
     well_name: str = Field(min_length=1, max_length=200)
+    operator_name: str | None = Field(default=None, max_length=200)
+    client_name: str | None = Field(default=None, max_length=200)
+    rig_name: str | None = Field(default=None, max_length=200)
+    location_text: str | None = Field(default=None, max_length=500)
     time_zone: str
     currency: str = Field(min_length=3, max_length=3)
-    unit_set: str
+    unit_set: Literal["Metric", "Field"]
+    reporting_start_date: date | None = None
 
 
 class ProjectView(ProjectCreate):
     id: UUID
     organisation_id: UUID
+    status: str = "draft"
+    row_version: int = 1
+    current_configuration_version_id: UUID | None = None
     active_configuration_snapshot_id: UUID | None = None
 
 
+class UnitValue(BaseModel):
+    value: str
+    unit: Literal["m", "ft"]
+    provenance: Literal["entered"] = "entered"
+
+
+class BasicInterval(BaseModel):
+    id: UUID
+    name: str = Field(min_length=1, max_length=200)
+    operation_mode: Literal["drilling", "completion", "workover"]
+    top_md: UnitValue | None = None
+    bottom_md: UnitValue | None = None
+
+
+class ProjectConfigurationData(BaseModel):
+    default_interval_id: UUID | None = None
+    intervals: list[BasicInterval] = Field(default_factory=list)
+
+
 class ConfigurationCreate(BaseModel):
-    data: dict[str, Any]
+    data: ProjectConfigurationData | None = None
+    change_summary: str | None = Field(default=None, max_length=1000)
+    copy_active: bool = True
+
+
+class ConfigurationPatch(BaseModel):
+    expected_version: int = Field(ge=1)
+    data: ProjectConfigurationData
+    change_summary: str | None = Field(default=None, max_length=1000)
 
 
 class ConfigurationView(BaseModel):
     id: UUID
     project_id: UUID
     version: int
-    state: Literal["draft", "active"]
+    state: Literal["draft", "active", "superseded"]
+    row_version: int
     data: dict[str, Any]
+    change_summary: str | None = None
+    activated_by: UUID | None = None
+    activated_at: datetime | None = None
     snapshot_id: UUID | None = None
     checksum: str | None = None
+
+
+class ConfigurationReadinessView(BaseModel):
+    state: Literal["ready", "incomplete"]
+    can_activate: bool
+    validated_version: int
+    draft_checksum: str
+    issues: list[dict[str, Any]]
+
+
+class ConfigurationActivation(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_checksum: str = Field(min_length=64, max_length=64)
 
 
 class DailyReportCreate(BaseModel):

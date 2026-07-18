@@ -1,6 +1,8 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+from app.store import FoundationStore
 from fastapi.testclient import TestClient
+from vantix_core.canonical import payload_checksum
 
 
 def headers(user_id=None, organisation_id=None, capabilities="") -> dict[str, str]:
@@ -32,14 +34,30 @@ def setup_report(client: TestClient):
             "unit_set": "Field",
         },
     ).json()
+    interval_id = str(uuid4())
     configuration = client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions",
-        headers=editor_headers,
-        json={"data": {"project": {"name": "North Sea A"}, "unit_set": {"name": "Field"}}},
+        headers={**editor_headers, "Idempotency-Key": "create-config-1"},
+        json={
+            "data": {
+                "default_interval_id": interval_id,
+                "intervals": [
+                    {
+                        "id": interval_id,
+                        "name": "Surface interval",
+                        "operation_mode": "drilling",
+                    }
+                ],
+            }
+        },
     ).json()
     client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/activate",
         headers={**editor_headers, "Idempotency-Key": "activate-config-1"},
+        json={
+            "expected_version": configuration["row_version"],
+            "expected_checksum": payload_checksum(configuration["data"]),
+        },
     )
     report = client.post(
         f"/api/v1/projects/{project['id']}/daily-reports",
@@ -65,7 +83,10 @@ def test_vtx_api_003_cross_tenant_project_returns_no_data(client: TestClient) ->
     _, _, _, project, _ = setup_report(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions",
-        headers=headers(capabilities="configure_project"),
+        headers={
+            **headers(capabilities="configure_project"),
+            "Idempotency-Key": "cross-tenant-config",
+        },
         json={"data": {}},
     )
     assert response.status_code == 404
@@ -139,3 +160,97 @@ def test_vtx_api_002_submit_retry_returns_original_response_without_duplicate_au
     )
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
+
+
+def test_vtx_prj_003_in_memory_activation_matches_hardened_lifecycle(
+    client: TestClient, foundation_store: FoundationStore
+) -> None:
+    org_id = uuid4()
+    request_headers = headers(uuid4(), org_id, "create_project,configure_project")
+
+    def create_project(code: str) -> dict:
+        response = client.post(
+            f"/api/v1/organisations/{org_id}/projects",
+            headers=request_headers,
+            json={
+                "project_code": code,
+                "project_name": f"Project {code}",
+                "well_name": f"Well {code}",
+                "time_zone": "Europe/London",
+                "currency": "GBP",
+                "unit_set": "Metric",
+            },
+        )
+        assert response.status_code == 201
+        return response.json()
+
+    incomplete_project = create_project("INC")
+    incomplete = client.post(
+        f"/api/v1/projects/{incomplete_project['id']}/configuration-versions",
+        headers={**request_headers, "Idempotency-Key": "create-incomplete"},
+        json={"data": {}},
+    ).json()
+    incomplete_activation = client.post(
+        f"/api/v1/projects/{incomplete_project['id']}/configuration-versions/"
+        f"{incomplete['id']}/activate",
+        headers={**request_headers, "Idempotency-Key": "activate-incomplete"},
+        json={
+            "expected_version": incomplete["row_version"],
+            "expected_checksum": payload_checksum(incomplete["data"]),
+        },
+    )
+    assert incomplete_activation.status_code == 422
+    assert incomplete_activation.json()["detail"]["code"] == "CONFIGURATION_NOT_READY"
+
+    project = create_project("SEQ")
+    project_id = project["id"]
+
+    def create_ready_configuration(key: str, name: str) -> dict:
+        interval_id = str(uuid4())
+        response = client.post(
+            f"/api/v1/projects/{project_id}/configuration-versions",
+            headers={**request_headers, "Idempotency-Key": key},
+            json={
+                "data": {
+                    "default_interval_id": interval_id,
+                    "intervals": [
+                        {
+                            "id": interval_id,
+                            "name": name,
+                            "operation_mode": "drilling",
+                        }
+                    ],
+                }
+            },
+        )
+        assert response.status_code == 201
+        return response.json()
+
+    def activate(configuration: dict, key: str):
+        return client.post(
+            f"/api/v1/projects/{project_id}/configuration-versions/{configuration['id']}/activate",
+            headers={**request_headers, "Idempotency-Key": key},
+            json={
+                "expected_version": configuration["row_version"],
+                "expected_checksum": payload_checksum(configuration["data"]),
+            },
+        )
+
+    first = create_ready_configuration("create-v1", "First interval")
+    assert activate(first, "activate-v1").status_code == 200
+    active_retry = activate(first, "reactivate-active-v1")
+    assert active_retry.status_code == 409
+    assert active_retry.json()["detail"]["code"] == "CONFIGURATION_NOT_DRAFT"
+
+    second = create_ready_configuration("create-v2", "Second interval")
+    assert activate(second, "activate-v2").status_code == 200
+    superseded_retry = activate(first, "reactivate-superseded-v1")
+    assert superseded_retry.status_code == 409
+    assert superseded_retry.json()["detail"]["code"] == "CONFIGURATION_NOT_DRAFT"
+
+    project_record = foundation_store.projects[UUID(project_id)]
+    records = project_record.configuration_versions
+    assert [record["state"] for record in records] == ["superseded", "active"]
+    assert sum(record["state"] == "active" for record in records) == 1
+    assert project_record.active_snapshot is not None
+    assert project_record.active_snapshot.version == 2
