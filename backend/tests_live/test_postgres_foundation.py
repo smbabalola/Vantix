@@ -26,6 +26,7 @@ from app.postgres_repository import PostgresFoundationRepository
 from app.schemas import (
     ConfigurationCreate,
     ConfigurationPatch,
+    ConfigurationVersionExpectation,
     DailyReportCreate,
     DecisionRequest,
     DraftPatch,
@@ -600,6 +601,277 @@ def test_vtx_pro_001_002_products_prices_are_ready_frozen_and_database_guarded()
     assert with_price.configuration_row_version == 3
 
 
+def test_vtx_pro_004_revised_configuration_preserves_stable_product_lineage() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    first = create_configuration(repository, auth, project.id, valid_configuration())
+    product_v1 = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=first.id,
+            expected_configuration_version=first.row_version,
+            item_code="BAR-001",
+            item_name="Barite",
+            packaging="sack",
+            package_size="25",
+            package_unit_code="kg",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+        ),
+    )
+    repository.create_product_price(
+        auth,
+        product_v1.id,
+        ProductPriceCreate(
+            expected_configuration_version=product_v1.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="18.5",
+            currency="GBP",
+            price_basis_unit_code="t",
+        ),
+    )
+    activate_configuration(repository, auth, project.id, first.id, "activate-lineage-v1")
+
+    second = create_configuration(
+        repository,
+        auth,
+        project.id,
+        ConfigurationCreate(copy_active=True),
+        "copy-lineage-v2",
+    )
+    product_v2 = repository.list_products(auth, project.id, second.id)[0]
+
+    assert product_v2.id != product_v1.id
+    assert product_v2.product_definition_id == product_v1.product_definition_id
+    assert product_v2.item_code == product_v1.item_code
+
+    active_v2 = activate_configuration(
+        repository, auth, project.id, second.id, "activate-lineage-v2"
+    )
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with engine.connect() as connection:
+        snapshots = connection.scalars(
+            select(ConfigurationSnapshot.snapshot_json)
+            .where(ConfigurationSnapshot.project_id == project.id)
+            .order_by(ConfigurationSnapshot.created_at)
+        ).all()
+    engine.dispose()
+    assert active_v2.snapshot_id is not None
+    assert snapshots[0]["products"][0]["id"] == str(product_v1.id)
+    assert snapshots[1]["products"][0]["id"] == str(product_v2.id)
+    assert snapshots[0]["products"][0]["product_definition_id"] == str(
+        product_v1.product_definition_id
+    )
+    assert snapshots[1]["products"][0]["product_definition_id"] == str(
+        product_v1.product_definition_id
+    )
+
+
+def test_vtx_pro_001_package_content_price_basis_matches_domain_and_database() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    mass = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=configuration.row_version,
+            item_code="BAR-001",
+            item_name="Barite",
+            packaging="sack",
+            package_size="25",
+            package_unit_code="kg",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+        ),
+    )
+    mass = repository.create_product_price(
+        auth,
+        mass.id,
+        ProductPriceCreate(
+            expected_configuration_version=mass.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="900",
+            currency="GBP",
+            price_basis_unit_code="t",
+        ),
+    )
+    volume = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=mass.configuration_row_version,
+            item_code="LIQ-001",
+            item_name="Liquid additive",
+            packaging="drum",
+            package_size="200",
+            package_unit_code="L",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+        ),
+    )
+    repository.create_product_price(
+        auth,
+        volume.id,
+        ProductPriceCreate(
+            expected_configuration_version=volume.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="4.5",
+            currency="GBP",
+            price_basis_unit_code="L",
+        ),
+    )
+
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO product_price_history "
+                "(id, organisation_id, project_id, project_product_id, effective_from, "
+                "unit_price, currency, price_basis_unit_code) VALUES "
+                "(:id, :org, :project, :product, '2027-01-01', 1, 'GBP', 'L')"
+            ),
+            {
+                "id": uuid4(),
+                "org": auth.organisation_id,
+                "project": project.id,
+                "product": mass.id,
+            },
+        )
+    engine.dispose()
+
+
+def test_vtx_pro_001_002_priced_product_delete_is_atomic_and_audited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+
+    def create_priced_product(code: str, expected_version: int):
+        product = repository.create_product(
+            auth,
+            project.id,
+            ProjectProductCreate(
+                configuration_version_id=configuration.id,
+                expected_configuration_version=expected_version,
+                item_code=code,
+                item_name=code,
+                packaging="sack",
+                package_size="25",
+                package_unit_code="kg",
+                inventory_applicable=True,
+                inventory_unit_code="package",
+            ),
+        )
+        first_price = repository.create_product_price(
+            auth,
+            product.id,
+            ProductPriceCreate(
+                expected_configuration_version=product.configuration_row_version,
+                effective_from="2026-01-01",
+                effective_to="2026-07-01",
+                unit_price="18",
+                currency="GBP",
+                price_basis_unit_code="t",
+            ),
+        )
+        return repository.create_product_price(
+            auth,
+            product.id,
+            ProductPriceCreate(
+                expected_configuration_version=first_price.configuration_row_version,
+                effective_from="2026-07-01",
+                unit_price="19",
+                currency="GBP",
+                price_basis_unit_code="t",
+            ),
+        )
+
+    priced = create_priced_product("DEL-001", configuration.row_version)
+    deleted = repository.delete_product(
+        auth,
+        priced.id,
+        ConfigurationVersionExpectation(
+            expected_configuration_version=priced.configuration_row_version
+        ),
+    )
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM project_products WHERE id = :id"), {"id": priced.id}
+            )
+            == 0
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM product_price_history WHERE project_product_id = :id"),
+                {"id": priced.id},
+            )
+            == 0
+        )
+        audit = connection.scalar(
+            select(AuditEvent).where(
+                AuditEvent.entity_id == priced.id,
+                AuditEvent.action == "delete_draft",
+            )
+        )
+        assert audit is not None
+        assert (
+            connection.scalar(
+                select(ConfigurationVersion.row_version).where(
+                    ConfigurationVersion.id == configuration.id
+                )
+            )
+            == deleted.configuration_row_version
+        )
+
+    rollback_candidate = create_priced_product("ROLL-001", deleted.configuration_row_version)
+    before_version = rollback_candidate.configuration_row_version
+
+    def fail_audit(*args, **kwargs) -> None:
+        raise RuntimeError("forced audit failure")
+
+    monkeypatch.setattr(repository, "_audit", fail_audit)
+    with pytest.raises(RuntimeError, match="forced audit failure"):
+        repository.delete_product(
+            auth,
+            rollback_candidate.id,
+            ConfigurationVersionExpectation(expected_configuration_version=before_version),
+        )
+    with engine.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM project_products WHERE id = :id"),
+                {"id": rollback_candidate.id},
+            )
+            == 1
+        )
+        assert (
+            connection.scalar(
+                text("SELECT count(*) FROM product_price_history WHERE project_product_id = :id"),
+                {"id": rollback_candidate.id},
+            )
+            == 2
+        )
+        assert (
+            connection.scalar(
+                select(ConfigurationVersion.row_version).where(
+                    ConfigurationVersion.id == configuration.id
+                )
+            )
+            == before_version
+        )
+    engine.dispose()
+
+
 def test_vtx_auth_004_005_product_rows_require_tenant_and_project_authority() -> None:
     repository = PostgresFoundationRepository()
     owner = context()
@@ -659,6 +931,7 @@ def test_vtx_auth_004_005_product_rows_require_tenant_and_project_authority() ->
     with app_engine.begin() as connection:
         set_context(connection)
         assert connection.scalar(text("SELECT count(*) FROM project_products")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM project_product_definitions")) == 0
 
     with pytest.raises(DBAPIError), app_engine.begin() as connection:
         set_context(connection)

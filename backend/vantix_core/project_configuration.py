@@ -342,7 +342,7 @@ def build_project_snapshot(
                 interval[field]["unit"] = canonical_unit
 
     snapshot = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "organisation_id": str(organisation_id),
         "project": {
             "id": str(project_id),

@@ -200,7 +200,9 @@ Returns status, payload checksum, renderer/template version, binary checksum, an
 Configuration-version scoped. POST requires `configuration_version_id` and
 `expected_configuration_version`. It records code/name, packaging, positive package size/content
 unit, explicit inventory applicability/unit, optional SG, and active state. The parent configuration
-row version is returned and incremented.
+row version is returned and incremented. Responses expose immutable project-scoped
+`product_definition_id` and configuration-owned product-version `id` separately. A revised draft
+preserves the former and creates a new latter.
 
 ### `PATCH/DELETE /project-products/{product_id}`
 
@@ -210,7 +212,9 @@ authority is locked. Delete is allowed only before activation and removes draft 
 ### `POST /project-products/{product_id}/prices`
 
 Requires the parent expected configuration version. Validates project currency, non-negative decimal
-price, compatible basis unit, and non-overlapping `[effective_from, effective_to)` range.
+price, explicit `effective_from`, package or package-content-compatible basis unit, and
+non-overlapping `[effective_from, effective_to)` range. Product validation failures include the
+exact affected `field` in the error detail.
 
 ### `PATCH/DELETE /product-prices/{price_id}`
 

@@ -30,12 +30,14 @@ The project-configuration snapshot slice adds:
 
 The project-products/pricing slice adds:
 
-- configuration-version-owned products with explicit packaging and inventory units
+- stable project product lineage with configuration-version-owned product authority
+- explicit packaging and inventory units, including package-content-compatible pricing
 - optional specific gravity with unavailable state preserved
 - effective-dated project-currency prices using non-overlapping half-open periods
 - optimistic concurrency, audit, RLS, and database immutability for product authority
 - configuration readiness/checksum and immutable snapshot inclusion
-- a responsive product/pricing grid without inventory posting or balance behaviour
+- a responsive product/pricing grid with deliberate effective dates, field errors, and unsaved-work gating
+- no inventory posting or balance behaviour
 
 PostgreSQL is the default runtime repository. The in-memory adapter remains only as an explicit
 test dependency override. Submission readiness, version checking, state transition, frozen

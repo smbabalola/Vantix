@@ -156,6 +156,7 @@ class ProductPriceView(ProductPriceFields):
 
 class ProjectProductView(ProjectProductFields):
     id: UUID
+    product_definition_id: UUID
     project_id: UUID
     configuration_version_id: UUID
     configuration_row_version: int

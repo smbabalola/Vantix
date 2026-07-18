@@ -35,6 +35,7 @@ describe("product and pricing grid", () => {
     const saved = vi.fn();
     const product = {
       id: "00000000-0000-4000-8000-000000000012",
+      product_definition_id: "00000000-0000-4000-8000-000000000013",
       project_id: configuration.project_id,
       configuration_version_id: configuration.id,
       configuration_row_version: 2,
@@ -62,6 +63,7 @@ describe("product and pricing grid", () => {
         disabled={false}
         onPendingChange={() => undefined}
         onSaved={saved}
+        onDirtyChange={() => undefined}
       />,
     );
 
@@ -78,9 +80,64 @@ describe("product and pricing grid", () => {
     );
     expect(screen.getByText("Inventory unit", { selector: "span" })).toBeInTheDocument();
     expect(saved).toHaveBeenCalledWith(2);
+    expect(screen.getByLabelText("From")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Add price" })).toBeDisabled();
+    expect(screen.getByLabelText("Per")).not.toHaveTextContent("L");
     await waitFor(() => expect(fetchMock).toHaveBeenLastCalledWith(
       expect.stringContaining("/products"),
       expect.objectContaining({ method: "POST" }),
     ));
+  });
+
+  it("VTX-PRO-001 exposes non-inventory creation and field-level server errors", async () => {
+    const product = {
+      id: "00000000-0000-4000-8000-000000000014",
+      product_definition_id: "00000000-0000-4000-8000-000000000015",
+      project_id: configuration.project_id,
+      configuration_version_id: configuration.id,
+      configuration_row_version: 1,
+      item_code: "DRM-001",
+      item_name: "Liquid additive",
+      alternate_name: null,
+      packaging: "drum",
+      package_size: "200",
+      package_unit_code: "L",
+      inventory_applicable: true,
+      inventory_unit_code: "package",
+      specific_gravity: null,
+      active: true,
+      prices: [],
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => response([product]))
+      .mockImplementationOnce(() => response({
+        detail: {
+          code: "PACKAGE_SIZE_INVALID",
+          message: "Value must be finite and greater than zero.",
+          field: "package_size",
+        },
+      }, 422));
+
+    render(
+      <ProductPricingGrid
+        configuration={configuration}
+        currency="GBP"
+        session={session}
+        disabled={false}
+        onPendingChange={() => undefined}
+        onSaved={() => undefined}
+        onDirtyChange={() => undefined}
+      />,
+    );
+    expect(await screen.findByText("Product authority loaded")).toBeInTheDocument();
+    const applicability = screen.getAllByLabelText("Inventory applicable");
+    fireEvent.click(applicability[1]);
+    expect(screen.getAllByLabelText("Inventory unit")[1]).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Size"), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save product" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Value must be finite and greater than zero.",
+    );
   });
 });

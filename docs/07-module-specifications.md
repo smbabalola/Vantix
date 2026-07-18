@@ -129,7 +129,13 @@ Observed: item code/name, alternate name, batch, unit size, unit, packaging, pri
 - price uses project currency and an explicit `package` or dimensionally compatible basis unit
 - at least one active product and one effective price per active product are required for activation
 - products and prices are owned by the mutable configuration version and frozen into its snapshot
+- an immutable project-scoped product definition provides ledger lineage; configuration product
+  versions preserve that identity across revised-draft copying while retaining distinct version IDs
+- snapshots include stable definition and applicable product-version identities
 - product and price mutations increment the parent configuration row version and use optimistic concurrency
+- package-counted stock may be priced per package or any unit dimensionally compatible with package
+  content; an effective-from date requires explicit user entry
+- any unsaved product or price draft invalidates readiness and blocks validation/activation
 - starting quantity and its opening transaction are deferred to the inventory-ledger slice; this slice never creates stock
 - catalogue changes do not alter historical transactions
 

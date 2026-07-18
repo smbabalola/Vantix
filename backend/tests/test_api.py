@@ -452,3 +452,20 @@ def test_vtx_pro_001_002_003_products_prices_readiness_and_snapshot_contract(
     snapshot = foundation_store.projects[UUID(project["id"])].active_snapshot
     assert snapshot is not None
     assert snapshot.payload["products"][0]["prices"][1]["unit_price"] == "19.25"
+    assert (
+        snapshot.payload["products"][0]["product_definition_id"]
+        == product_body["product_definition_id"]
+    )
+
+    revised = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions",
+        headers={**request_headers, "Idempotency-Key": "copy-product-configuration"},
+        json={"copy_active": True},
+    ).json()
+    copied = client.get(
+        f"/api/v1/projects/{project['id']}/products",
+        params={"configuration_version_id": revised["id"]},
+        headers=request_headers,
+    ).json()[0]
+    assert copied["id"] != product_body["id"]
+    assert copied["product_definition_id"] == product_body["product_definition_id"]

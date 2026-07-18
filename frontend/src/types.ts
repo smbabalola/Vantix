@@ -113,6 +113,7 @@ export interface ProductPrice {
 
 export interface ProjectProduct {
   id: string;
+  product_definition_id: string;
   project_id: string;
   configuration_version_id: string;
   configuration_row_version: number;

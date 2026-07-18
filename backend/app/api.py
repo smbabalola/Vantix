@@ -614,6 +614,7 @@ def create_product(
             detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
         )
     product_id = uuid4()
+    product_definition_id = uuid4()
     values = body.model_dump(
         mode="json",
         exclude={"configuration_version_id", "expected_configuration_version"},
@@ -621,7 +622,12 @@ def create_product(
     )
     try:
         canonical = canonicalise_product(
-            {"id": str(product_id), **values, "prices": []},
+            {
+                "id": str(product_id),
+                "product_definition_id": str(product_definition_id),
+                **values,
+                "prices": [],
+            },
             project.currency,
             require_price=False,
         )
@@ -679,7 +685,12 @@ def patch_product(
     )
     try:
         canonical = canonicalise_product(
-            {"id": str(product_id), **values, "prices": current["prices"]},
+            {
+                "id": str(product_id),
+                "product_definition_id": str(product["product_definition_id"]),
+                **values,
+                "prices": current["prices"],
+            },
             project.currency,
             require_price=False,
         )

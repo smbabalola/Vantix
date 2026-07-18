@@ -13,6 +13,7 @@ from vantix_core.products import (
 def product() -> dict:
     return {
         "id": str(uuid4()),
+        "product_definition_id": str(uuid4()),
         "item_code": "BAR-001",
         "item_name": "Barite",
         "packaging": "sack",
@@ -78,3 +79,28 @@ def test_vtx_pro_001_missing_sg_is_allowed_but_unit_dimension_mismatch_is_not() 
     candidate["inventory_unit_code"] = "package"
     canonical = canonicalise_product(candidate, "GBP")
     assert "specific_gravity" not in canonical
+
+
+@pytest.mark.parametrize(
+    ("package_unit", "price_basis"),
+    [("kg", "t"), ("L", "L")],
+)
+def test_vtx_pro_001_package_inventory_accepts_content_compatible_pricing(
+    package_unit: str, price_basis: str
+) -> None:
+    candidate = product()
+    candidate["package_unit_code"] = package_unit
+    candidate["inventory_unit_code"] = "package"
+    for price in candidate["prices"]:
+        price["price_basis_unit_code"] = price_basis
+    canonical = canonicalise_product(candidate, "GBP")
+    assert canonical["prices"][0]["price_basis_unit_code"] == price_basis
+
+
+def test_vtx_pro_001_mass_product_rejects_volume_price_without_conversion_basis() -> None:
+    candidate = product()
+    candidate["inventory_unit_code"] = "package"
+    candidate["prices"][0]["price_basis_unit_code"] = "L"
+    with pytest.raises(ProductValidationError) as mismatch:
+        canonicalise_product(candidate, "GBP")
+    assert mismatch.value.code == "PRICE_BASIS_UNIT_MISMATCH"

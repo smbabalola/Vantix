@@ -14,7 +14,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
 from vantix_core.products import (
@@ -41,6 +41,7 @@ from .models import (
     IdempotencyRecord,
     Organisation,
     OrganisationMembership,
+    ProductDefinition,
     ProductPrice,
     Project,
     ProjectMembership,
@@ -326,6 +327,7 @@ class PostgresFoundationRepository:
         ).all()
         return ProjectProductView(
             id=product.id,
+            product_definition_id=product.product_definition_id,
             project_id=product.project_id,
             configuration_version_id=product.configuration_version_id,
             configuration_row_version=configuration_row_version,
@@ -368,7 +370,10 @@ class PostgresFoundationRepository:
 
     @staticmethod
     def _product_error(exc: ProductValidationError) -> HTTPException:
-        return _error(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.code, str(exc))
+        return HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": exc.code, "message": str(exc), "field": exc.field},
+        )
 
     @staticmethod
     def _lock_idempotency(
@@ -587,6 +592,7 @@ class PostgresFoundationRepository:
                         organisation_id=auth.organisation_id,
                         project_id=project_id,
                         configuration_version_id=configuration.id,
+                        product_definition_id=source_product.product_definition_id,
                         item_code=source_product.item_code,
                         item_name=source_product.item_name,
                         alternate_name=source_product.alternate_name,
@@ -775,6 +781,7 @@ class PostgresFoundationRepository:
                 body.expected_configuration_version,
             )
             product_id = uuid4()
+            product_definition_id = uuid4()
             values = body.model_dump(
                 mode="json",
                 exclude={"configuration_version_id", "expected_configuration_version"},
@@ -782,7 +789,12 @@ class PostgresFoundationRepository:
             )
             try:
                 canonical = canonicalise_product(
-                    {"id": str(product_id), **values, "prices": []},
+                    {
+                        "id": str(product_id),
+                        "product_definition_id": str(product_definition_id),
+                        **values,
+                        "prices": [],
+                    },
                     project.currency,
                     require_price=False,
                 )
@@ -796,11 +808,19 @@ class PostgresFoundationRepository:
             )
             if duplicate is not None:
                 raise _error(status.HTTP_409_CONFLICT, "PRODUCT_CODE_EXISTS")
+            session.add(
+                ProductDefinition(
+                    id=product_definition_id,
+                    organisation_id=auth.organisation_id,
+                    project_id=project_id,
+                )
+            )
             product = ProjectProduct(
                 id=product_id,
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
                 configuration_version_id=configuration.id,
+                product_definition_id=product_definition_id,
                 item_code=canonical["item_code"],
                 item_name=canonical["item_name"],
                 alternate_name=canonical.get("alternate_name"),
@@ -853,7 +873,12 @@ class PostgresFoundationRepository:
             )
             try:
                 canonical = canonicalise_product(
-                    {"id": str(product.id), **values, "prices": before["prices"]},
+                    {
+                        "id": str(product.id),
+                        "product_definition_id": str(product.product_definition_id),
+                        **values,
+                        "prices": before["prices"],
+                    },
                     project.currency,
                     require_price=False,
                 )
@@ -917,6 +942,10 @@ class PostgresFoundationRepository:
             before = self._product_view(session, product, configuration.row_version).model_dump(
                 mode="json"
             )
+            session.execute(
+                delete(ProductPrice).where(ProductPrice.project_product_id == product.id)
+            )
+            session.flush()
             session.delete(product)
             configuration.row_version += 1
             session.flush()
@@ -1241,7 +1270,7 @@ class PostgresFoundationRepository:
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
                 configuration_version_id=configuration.id,
-                schema_version="1.1",
+                schema_version="1.2",
                 snapshot_json=snapshot_json,
                 canonical_checksum=checksum,
             )

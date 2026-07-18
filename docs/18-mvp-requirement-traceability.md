@@ -22,7 +22,7 @@ Every production-MVP requirement must map to acceptance IDs before implementatio
 | MVP-OPS-02 | Time distribution is recorded and validated | VTX-DAY-010 | 05 Schema / 07 Modules |
 | MVP-OPS-03 | Problems are recorded without copied defaults | VTX-DAY-002, VTX-DAY-010 | 03 App Flow / 07 Modules |
 | MVP-OPS-04 | Comments support client/internal visibility | VTX-COM-001 to VTX-COM-004, VTX-AUTH-010 | 07 Modules / 13 Auth |
-| MVP-PRO-01 | Configuration-owned products have explicit packaging/inventory units, applicability, optional SG, non-overlapping effective price, and immutable snapshot authority | VTX-PRO-001 to VTX-PRO-004, VTX-PRJ-002 to VTX-PRJ-005 | 07 Modules / 05 Schema / project-products-pricing-v1 contract |
+| MVP-PRO-01 | Stable project product lineage has configuration-owned product versions, explicit packaging/inventory units, applicability, optional SG, deliberate non-overlapping effective prices, and immutable snapshot authority | VTX-PRO-001 to VTX-PRO-004, VTX-PRJ-002 to VTX-PRJ-005 | 07 Modules / 05 Schema / project-products-pricing-v1 contract |
 | MVP-PRO-02 | Starting stock creates opening ledger posting | VTX-PRO-005, VTX-REC-007 | 14 Reconciliation |
 | MVP-TRF-01 | Draft ticket has no balance effect | VTX-TRF-001, VTX-REC-001 | 14 Reconciliation |
 | MVP-TRF-02 | Ticket posting is atomic and idempotent | VTX-TRF-002, VTX-TRF-003, VTX-TRF-006, VTX-REC-002, VTX-REC-003 | 14 Reconciliation / 17 API |

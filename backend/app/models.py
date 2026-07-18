@@ -136,6 +136,17 @@ class ConfigurationVersion(TenantMixin, Base):
     )
 
 
+class ProductDefinition(TenantMixin, Base):
+    __tablename__ = "project_product_definitions"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class ProjectProduct(TenantMixin, Base):
     __tablename__ = "project_products"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -144,6 +155,9 @@ class ProjectProduct(TenantMixin, Base):
     )
     configuration_version_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("project_configuration_versions.id"), nullable=False
+    )
+    product_definition_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_product_definitions.id"), nullable=False
     )
     item_code: Mapped[str] = mapped_column(String(100), nullable=False)
     item_name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -161,6 +175,11 @@ class ProjectProduct(TenantMixin, Base):
             "configuration_version_id",
             func.lower(item_code),
             unique=True,
+        ),
+        UniqueConstraint(
+            "configuration_version_id",
+            "product_definition_id",
+            name="uq_project_products_configuration_definition",
         ),
         CheckConstraint("package_size > 0", name="ck_project_products_package_size"),
         CheckConstraint(

@@ -41,6 +41,7 @@ h1 { font-size: clamp(28px, 4vw, 42px); line-height: 1.05; }
 h2 { font-size: 20px; }
 .header-status { display: flex; align-items: center; gap: 10px; }
 .save-state { color: var(--muted); font-size: 13px; }
+.field-error { color: #b42318; display: block; font-size: .78rem; font-weight: 600; margin-top: .25rem; }
 .save-conflict, .save-failed { color: var(--red); font-weight: 700; }
 .state-badge { display: inline-flex; align-items: center; min-height: 27px; padding: 4px 9px; border-radius: 999px; background: #e3e9e8; color: #526367; font-size: 11px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
 .state-approved, .state-ready { color: #0b655b; background: var(--teal-soft); }

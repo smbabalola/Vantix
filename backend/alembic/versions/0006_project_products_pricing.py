@@ -44,11 +44,31 @@ def _project_member(table: str, configure: bool) -> str:
 
 def upgrade() -> None:
     op.create_table(
+        "project_product_definitions",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("organisation_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("project_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
+    )
+    op.create_index(
+        "ix_project_product_definitions_organisation_id",
+        "project_product_definitions",
+        ["organisation_id"],
+    )
+
+    op.create_table(
         "project_products",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("organisation_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("project_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("configuration_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("product_definition_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("item_code", sa.String(100), nullable=False),
         sa.Column("item_name", sa.String(200), nullable=False),
         sa.Column("alternate_name", sa.String(200)),
@@ -62,6 +82,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
         sa.ForeignKeyConstraint(
             ["configuration_version_id"], ["project_configuration_versions.id"]
+        ),
+        sa.ForeignKeyConstraint(["product_definition_id"], ["project_product_definitions.id"]),
+        sa.UniqueConstraint(
+            "configuration_version_id",
+            "product_definition_id",
+            name="uq_project_products_configuration_definition",
         ),
         sa.CheckConstraint("package_size > 0", name="ck_project_products_package_size"),
         sa.CheckConstraint(
@@ -140,7 +166,11 @@ def upgrade() -> None:
         ["organisation_id"],
     )
 
-    for table in ("project_products", "product_price_history"):
+    for table in (
+        "project_product_definitions",
+        "project_products",
+        "product_price_history",
+    ):
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
         op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
         op.execute(
@@ -187,16 +217,38 @@ def upgrade() -> None:
 
     op.execute(
         """
+        CREATE FUNCTION vantix_guard_product_definition()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'stable product definition is immutable';
+        END;
+        $$;
+
+        CREATE TRIGGER project_product_definitions_immutable
+        BEFORE UPDATE OR DELETE ON project_product_definitions
+        FOR EACH ROW EXECUTE FUNCTION vantix_guard_product_definition();
+
         CREATE FUNCTION vantix_guard_product_configuration()
         RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE
           row_record record;
           parent_product project_products%ROWTYPE;
           configuration_state text;
+          definition_project_id uuid;
+          definition_organisation_id uuid;
         BEGIN
           IF TG_OP = 'DELETE' THEN row_record := OLD; ELSE row_record := NEW; END IF;
 
           IF TG_TABLE_NAME = 'project_products' THEN
+            SELECT project_id, organisation_id
+              INTO definition_project_id, definition_organisation_id
+              FROM project_product_definitions
+             WHERE id = row_record.product_definition_id;
+            IF NOT FOUND
+               OR definition_project_id <> row_record.project_id
+               OR definition_organisation_id <> row_record.organisation_id THEN
+              RAISE EXCEPTION 'product definition ownership mismatch';
+            END IF;
             SELECT state INTO configuration_state
               FROM project_configuration_versions
              WHERE id = row_record.configuration_version_id
@@ -225,7 +277,8 @@ def upgrade() -> None:
               RAISE EXCEPTION 'product configuration identity is immutable';
             END IF;
             IF TG_TABLE_NAME = 'project_products' THEN
-              IF OLD.configuration_version_id IS DISTINCT FROM NEW.configuration_version_id THEN
+              IF OLD.configuration_version_id IS DISTINCT FROM NEW.configuration_version_id
+                 OR OLD.product_definition_id IS DISTINCT FROM NEW.product_definition_id THEN
                 RAISE EXCEPTION 'product configuration identity is immutable';
               END IF;
             ELSE
@@ -252,9 +305,7 @@ def upgrade() -> None:
           product project_products%ROWTYPE;
           project_currency text;
           package_dimension text;
-          inventory_dimension text;
           basis_dimension text;
-          target_dimension text;
         BEGIN
           PERFORM pg_advisory_xact_lock(hashtextextended(NEW.project_product_id::text, 0));
           SELECT * INTO product FROM project_products WHERE id = NEW.project_product_id;
@@ -267,21 +318,12 @@ def upgrade() -> None:
             WHEN product.package_unit_code IN ('kg','t','lb') THEN 'mass'
             WHEN product.package_unit_code IN ('L','m3','gal_us','bbl') THEN 'volume'
             ELSE 'count' END;
-          inventory_dimension := CASE
-            WHEN product.inventory_unit_code IN ('kg','t','lb') THEN 'mass'
-            WHEN product.inventory_unit_code IN ('L','m3','gal_us','bbl') THEN 'volume'
-            WHEN product.inventory_unit_code = 'each' THEN 'count'
-            ELSE 'package' END;
           basis_dimension := CASE
             WHEN NEW.price_basis_unit_code IN ('kg','t','lb') THEN 'mass'
             WHEN NEW.price_basis_unit_code IN ('L','m3','gal_us','bbl') THEN 'volume'
             WHEN NEW.price_basis_unit_code = 'each' THEN 'count'
             ELSE 'package' END;
-          target_dimension := package_dimension;
-          IF product.inventory_applicable THEN
-            target_dimension := inventory_dimension;
-          END IF;
-          IF basis_dimension <> 'package' AND basis_dimension <> target_dimension THEN
+          IF basis_dimension <> 'package' AND basis_dimension <> package_dimension THEN
             RAISE EXCEPTION 'price basis is dimensionally incompatible';
           END IF;
 
@@ -309,9 +351,18 @@ def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS product_prices_range_guard ON product_price_history")
     op.execute("DROP TRIGGER IF EXISTS product_prices_configuration_guard ON product_price_history")
     op.execute("DROP TRIGGER IF EXISTS project_products_configuration_guard ON project_products")
+    op.execute(
+        "DROP TRIGGER IF EXISTS project_product_definitions_immutable "
+        "ON project_product_definitions"
+    )
     op.execute("DROP FUNCTION IF EXISTS vantix_guard_product_price()")
     op.execute("DROP FUNCTION IF EXISTS vantix_guard_product_configuration()")
-    for table in ("product_price_history", "project_products"):
+    op.execute("DROP FUNCTION IF EXISTS vantix_guard_product_definition()")
+    for table in (
+        "product_price_history",
+        "project_products",
+        "project_product_definitions",
+    ):
         for command in ("select", "insert", "update", "delete"):
             op.execute(f"DROP POLICY IF EXISTS {table}_{command}_scope ON {table}")
         op.execute(f"DROP POLICY IF EXISTS {table}_tenant_policy ON {table}")
@@ -319,3 +370,4 @@ def downgrade() -> None:
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
     op.drop_table("product_price_history")
     op.drop_table("project_products")
+    op.drop_table("project_product_definitions")

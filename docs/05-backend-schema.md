@@ -130,9 +130,11 @@ constraint triggers so every referenced configuration remains in the same organi
 Project/report/revision snapshot bindings and configuration ownership identities are immutable.
 
 Foundation V1 stores structured draft configuration in `data` and freezes the canonical activated
-form in `project_configuration_snapshots`. Product/pricing snapshot schema 1.1 composes relational
+form in `project_configuration_snapshots`. Product/pricing snapshot schema 1.2 composes relational
 project products and prices with project identity/units and basic interval context before validation,
-checksum, and activation. Pits, fluid systems, personnel, equipment, screens, losses, formation, and
+checksum, and activation. It freezes stable product-definition lineage and the applicable
+configuration-owned product-version identity separately. Pits, fluid systems, personnel, equipment,
+screens, losses, formation, and
 directional groups remain absent until their vertical slices; no group is fabricated.
 
 ### project_intervals
@@ -201,9 +203,22 @@ Organisation-level optional master catalogue:
 - product_group
 - status
 
+### project_product_definitions
+
+Stable project-scoped ledger identity:
+
+- id
+- organisation_id
+- project_id
+- created_at
+
+Definition identity and ownership are immutable. Item code and other editable authority do not live
+on this row and cannot become ledger lineage.
+
 ### project_products
 
 - id
+- product_definition_id
 - configuration_version_id
 - catalogue_product_id nullable
 - item_code
@@ -223,6 +238,8 @@ Organisation-level optional master catalogue:
 
 Product code is case-insensitively unique within a configuration version. Package size and optional
 specific gravity are positive decimals. Controlled units and dimensional compatibility are enforced.
+One product definition appears at most once in a configuration version. Revised drafts preserve
+`product_definition_id` while creating a new product-version `id`.
 Starting quantity is deliberately absent from this slice because opening stock requires the later
 append-only inventory posting contract.
 
@@ -240,10 +257,12 @@ append-only inventory posting contract.
 - source
 - approved_by
 
-No overlapping active price ranges for the same project product and price basis.
+No overlapping active price ranges for the same project product. A basis is `package` or a unit
+dimensionally compatible with package content, even when inventory is counted in packages.
 Ranges use `[effective_from, effective_to)` semantics. Product/price rows are mutable only while the
 owning configuration is draft, inherit tenant/project RLS, increment parent configuration version on
-API mutation, and are frozen into the activation snapshot.
+API mutation, and are frozen into the activation snapshot. Draft product deletion removes price rows
+explicitly before the product version in the same audited transaction.
 
 ## 6. Personnel, equipment, and screen tables
 
@@ -692,7 +711,8 @@ A ticket persists across report revisions because posting changes the project le
 
 - id
 - ticket_id
-- project_product_id
+- product_definition_id
+- project_product_version_id (frozen configuration context)
 - batch_number
 - unit_code
 - ticket_quantity
@@ -723,7 +743,9 @@ Append-only posting header:
 
 - id
 - posting_id
-- project_product_id
+- product_definition_id
+- project_product_version_id (frozen configuration context)
+- product_price_version_id nullable
 - batch_number nullable
 - entered_quantity
 - entered_unit_code
@@ -743,7 +765,8 @@ Positive canonical quantity increases stock; negative quantity decreases stock. 
 Revision-owned observation:
 
 - daily_report_revision_id
-- project_product_id
+- product_definition_id
+- project_product_version_id (frozen report configuration context)
 - batch_number nullable
 - physical_closing_quantity
 - unit_code
@@ -756,7 +779,8 @@ Revision-owned observation:
 Derived for one revision and frozen in its report payload:
 
 - daily_report_revision_id
-- project_product_id
+- product_definition_id
+- project_product_version_id (frozen report configuration context)
 - batch_number nullable
 - opening_quantity
 - calculated_closing_quantity

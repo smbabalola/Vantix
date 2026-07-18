@@ -43,12 +43,13 @@ Configuration version and activation metadata
 
 ## Snapshot rules
 
-- product/pricing activation emits project snapshot schema `1.1`
+- product/pricing lineage hardening emits project snapshot schema `1.2`
 - created and frozen when a configuration version is activated
 - bound immutably to a new daily-report revision at creation; a later activation does not rebind it
 - does not include secrets or unnecessary personal identifiers
 - stores display labels as well as IDs
 - includes products in stable item-code order and prices in effective-from/ID order
+- includes immutable `product_definition_id` lineage and configuration-owned product-version `id`
 - includes effective price, packaging, inventory applicability, SG availability, and unit context
 - indicates `observed`, `imported`, `entered`, or `calculated` provenance where relevant
 - compatible with report payload schema versioning

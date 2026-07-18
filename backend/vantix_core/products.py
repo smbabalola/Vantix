@@ -64,6 +64,9 @@ def canonicalise_product(
 ) -> dict[str, Any]:
     result = deepcopy(dict(product))
     result["id"] = _uuid(product.get("id"), "id")
+    result["product_definition_id"] = _uuid(
+        product.get("product_definition_id"), "product_definition_id"
+    )
     for field in ("item_code", "item_name"):
         value = product.get(field)
         if not isinstance(value, str) or not value.strip():
@@ -180,25 +183,14 @@ def canonicalise_price(
             "Price currency must match the project currency.",
         )
     basis = price.get("price_basis_unit_code")
-    inventory_unit = product.get("inventory_unit_code")
     package_unit = str(product["package_unit_code"])
     allowed_basis = {"package"}
-    if inventory_unit and inventory_unit != "package":
-        dimension = UNIT_DIMENSIONS[str(inventory_unit)]
-        allowed_basis.update(
-            unit
-            for unit, candidate_dimension in UNIT_DIMENSIONS.items()
-            if candidate_dimension == dimension
-        )
-    elif inventory_unit == "package":
-        allowed_basis.add("package")
-    else:
-        dimension = UNIT_DIMENSIONS[package_unit]
-        allowed_basis.update(
-            unit
-            for unit, candidate_dimension in UNIT_DIMENSIONS.items()
-            if candidate_dimension == dimension
-        )
+    package_dimension = UNIT_DIMENSIONS[package_unit]
+    allowed_basis.update(
+        unit
+        for unit, candidate_dimension in UNIT_DIMENSIONS.items()
+        if candidate_dimension == package_dimension
+    )
     if basis not in allowed_basis:
         raise ProductValidationError(
             "PRICE_BASIS_UNIT_MISMATCH",

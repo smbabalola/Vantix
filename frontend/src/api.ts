@@ -20,6 +20,7 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
+    public readonly field?: string,
   ) {
     super(message);
   }
@@ -39,7 +40,12 @@ async function request<T>(session: Session, path: string, init: RequestInit = {}
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     const detail = body.detail ?? body;
-    throw new ApiError(response.status, detail.code ?? "REQUEST_FAILED", detail.message ?? "Request failed");
+    throw new ApiError(
+      response.status,
+      detail.code ?? "REQUEST_FAILED",
+      detail.message ?? "Request failed",
+      detail.field,
+    );
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -122,7 +128,7 @@ export const api = {
   createProduct(
     session: Session,
     configuration: ProjectConfiguration,
-    values: Omit<ProjectProduct, "id" | "project_id" | "configuration_version_id" | "configuration_row_version" | "prices">,
+    values: Omit<ProjectProduct, "id" | "product_definition_id" | "project_id" | "configuration_version_id" | "configuration_row_version" | "prices">,
   ): Promise<ProjectProduct> {
     return request(session, `/projects/${configuration.project_id}/products`, {
       method: "POST",

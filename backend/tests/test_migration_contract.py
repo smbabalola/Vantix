@@ -78,6 +78,8 @@ def test_vtx_prj_003_same_project_constraint_triggers_are_reversible() -> None:
 
 
 def test_vtx_pro_002_product_price_periods_rls_and_immutability_are_database_guarded() -> None:
+    assert "project_product_definitions" in PRODUCTS_PRICING
+    assert "stable product definition is immutable" in PRODUCTS_PRICING
     assert "effective product price periods cannot overlap" in PRODUCTS_PRICING
     assert "FORCE ROW LEVEL SECURITY" in PRODUCTS_PRICING
     assert "product configuration is immutable" in PRODUCTS_PRICING
@@ -85,3 +87,4 @@ def test_vtx_pro_002_product_price_periods_rls_and_immutability_are_database_gua
     assert "DROP FUNCTION IF EXISTS vantix_guard_product_price()" in downgrade
     assert 'op.drop_table("product_price_history")' in downgrade
     assert 'op.drop_table("project_products")' in downgrade
+    assert 'op.drop_table("project_product_definitions")' in downgrade

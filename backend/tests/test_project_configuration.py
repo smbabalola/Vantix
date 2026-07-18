@@ -39,6 +39,7 @@ def configuration() -> dict:
         "products": [
             {
                 "id": product_id,
+                "product_definition_id": str(uuid4()),
                 "item_code": "BAR-001",
                 "item_name": "Barite",
                 "packaging": "sack",
