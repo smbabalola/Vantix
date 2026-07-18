@@ -61,11 +61,38 @@ Required MVP fields:
 
 Creates mutable configuration version from current active version or blank defaults.
 
+Optional body fields: `data`, `change_summary`, and `copy_active` (default true). When an active
+version exists and `data` is omitted, the server copies the active structured configuration. The
+response includes draft `row_version`.
+
+### `GET /projects/{project_id}/configuration-versions`
+
+Returns authorised version summaries and the active/superseded/draft state without exposing another
+project's configuration.
+
+### `GET /projects/{project_id}/configuration-versions/{version_id}`
+
+Returns one authorised version and its structured data.
+
+### `PATCH /projects/{project_id}/configuration-versions/{version_id}`
+
+Updates a draft only. Requires `If-Match`/expected row version and returns the incremented version.
+Active or superseded versions are locked.
+
+### `POST /projects/{project_id}/configuration-versions/{version_id}/validate`
+
+Returns activation readiness without changing state. Missing project identity/units, missing basic
+interval/default interval/operation mode, invalid references, and invalid optional depth bounds are
+reported explicitly.
+
 ### `POST /projects/{project_id}/configuration-versions/{version_id}/activate`
 
 Validates readiness, freezes snapshot/checksum, and sets active version atomically.
 
 Headers: `Idempotency-Key`.
+
+Activation also supersedes the prior active version, records activation actor/time and audit events,
+and updates the project's current configuration version/snapshot pointers in the same transaction.
 
 ## 4. Daily report aggregate and revisions
 

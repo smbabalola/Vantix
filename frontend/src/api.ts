@@ -1,4 +1,11 @@
-import type { GeneralSection, Readiness, Report } from "./types";
+import type {
+  ConfigurationReadiness,
+  GeneralSection,
+  Project,
+  ProjectConfiguration,
+  Readiness,
+  Report,
+} from "./types";
 
 export interface Session {
   userId: string;
@@ -36,6 +43,55 @@ async function request<T>(session: Session, path: string, init: RequestInit = {}
 }
 
 export const api = {
+  getProject(session: Session, projectId: string): Promise<Project> {
+    return request(session, `/projects/${projectId}`);
+  },
+  listConfigurations(session: Session, projectId: string): Promise<ProjectConfiguration[]> {
+    return request(session, `/projects/${projectId}/configuration-versions`);
+  },
+  createConfiguration(session: Session, projectId: string): Promise<ProjectConfiguration> {
+    return request(session, `/projects/${projectId}/configuration-versions`, {
+      method: "POST",
+      body: JSON.stringify({ copy_active: true }),
+    });
+  },
+  saveConfiguration(
+    session: Session,
+    configuration: ProjectConfiguration,
+  ): Promise<ProjectConfiguration> {
+    return request(
+      session,
+      `/projects/${configuration.project_id}/configuration-versions/${configuration.id}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          expected_version: configuration.row_version,
+          data: configuration.data,
+          change_summary: configuration.change_summary,
+        }),
+      },
+    );
+  },
+  validateConfiguration(
+    session: Session,
+    configuration: ProjectConfiguration,
+  ): Promise<ConfigurationReadiness> {
+    return request(
+      session,
+      `/projects/${configuration.project_id}/configuration-versions/${configuration.id}/validate`,
+      { method: "POST" },
+    );
+  },
+  activateConfiguration(
+    session: Session,
+    configuration: ProjectConfiguration,
+  ): Promise<ProjectConfiguration> {
+    return request(
+      session,
+      `/projects/${configuration.project_id}/configuration-versions/${configuration.id}/activate`,
+      { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() } },
+    );
+  },
   getReport(session: Session, reportId: string): Promise<Report> {
     return request(session, `/daily-reports/${reportId}`);
   },

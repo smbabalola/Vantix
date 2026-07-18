@@ -7,6 +7,9 @@ MEMBERSHIP_RLS = Path("backend/alembic/versions/0002_membership_bound_rls.py").r
 TRANSITION_GUARD = Path("backend/alembic/versions/0004_harden_revision_transitions.py").read_text(
     encoding="utf-8"
 )
+CONFIGURATION_LIFECYCLE = Path(
+    "backend/alembic/versions/0005_project_configuration_lifecycle.py"
+).read_text(encoding="utf-8")
 
 
 def test_vtx_auth_004_005_tenant_tables_enable_and_force_rls() -> None:
@@ -45,3 +48,11 @@ def test_vtx_mvp_001_migration_history_is_self_contained_and_reversible() -> Non
 def test_vtx_mvp_006_terminal_state_transition_guard_is_installed() -> None:
     assert "terminal report revision cannot be changed" in TRANSITION_GUARD
     assert "NEW.state NOT IN ('approved', 'rejected')" in TRANSITION_GUARD
+
+
+def test_vtx_prj_003_004_configuration_lifecycle_is_guarded_and_reversible() -> None:
+    assert "project_configuration_versions_guard" in CONFIGURATION_LIFECYCLE
+    assert "active project configuration is immutable" in CONFIGURATION_LIFECYCLE
+    downgrade = CONFIGURATION_LIFECYCLE.split("def downgrade()", maxsplit=1)[1]
+    assert "DROP TRIGGER IF EXISTS project_configuration_versions_guard" in downgrade
+    assert "DROP FUNCTION IF EXISTS vantix_guard_configuration_mutation()" in downgrade

@@ -122,6 +122,13 @@ Roles:
 - created_by
 - activated_by
 - activated_at
+- row_version for draft optimistic concurrency
+
+Foundation V1 stores structured draft configuration in `data` and freezes the canonical activated
+form in `project_configuration_snapshots`. Required V1 groups are project identity/units and basic
+interval context. Products, pits, fluid systems, prices, personnel, equipment, screens, losses,
+formation, and directional groups are added only by their later vertical slices; absent groups are
+not fabricated during activation.
 
 ### project_intervals
 
@@ -143,6 +150,10 @@ Roles:
 - status
 
 Detailed interval fields remain subject to product confirmation.
+
+For foundation V1, `top_md` and `bottom_md` are optional canonical unit-bearing value objects. If
+both exist, their units match and bottom MD is greater than top MD. TVD, hole/casing geometry,
+planned dates, and fluid-system binding remain absent unless a later approved slice defines them.
 
 ## 5. Units and catalogue tables
 

@@ -32,6 +32,11 @@ class ProjectRecord:
     time_zone: str
     currency: str
     unit_set: str
+    operator_name: str | None
+    client_name: str | None
+    rig_name: str | None
+    location_text: str | None
+    reporting_start_date: Any | None
     configuration_versions: list[dict[str, Any]]
     active_snapshot: ConfigurationSnapshot | None = None
 
@@ -76,6 +81,11 @@ class FoundationStore:
                 time_zone=values["time_zone"],
                 currency=values["currency"],
                 unit_set=values["unit_set"],
+                operator_name=values.get("operator_name"),
+                client_name=values.get("client_name"),
+                rig_name=values.get("rig_name"),
+                location_text=values.get("location_text"),
+                reporting_start_date=values.get("reporting_start_date"),
                 configuration_versions=[],
             )
             self.projects[record.id] = record

@@ -15,7 +15,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .48; }
 
@@ -62,6 +62,10 @@ label { display: grid; gap: 7px; color: #3d5055; font-size: 12px; font-weight: 7
 input { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #cbd7d5; border-radius: 8px; color: var(--ink); background: white; outline: none; }
 input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb(20 125 117 / 12%); }
 input:disabled { background: #f2f5f4; }
+.interval-card { margin: 0 0 18px; padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
+.interval-card legend { padding: 0 7px; font-size: 13px; font-weight: 800; }
+.default-choice { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
+.default-choice input { width: auto; min-height: auto; }
 .button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; padding-top: 20px; border-top: 1px solid #e5eae9; }
 .button { min-height: 40px; padding: 9px 14px; border: 1px solid transparent; border-radius: 8px; font-size: 12px; font-weight: 750; }
 .button.primary { color: white; background: var(--teal); }

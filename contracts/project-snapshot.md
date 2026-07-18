@@ -4,6 +4,22 @@ A daily report snapshot must contain the configuration needed to understand and 
 
 ## Required groups
 
+Groups become required only when their authoritative MVP vertical slice is implemented. Foundation
+V1 freezes the following subset:
+
+```text
+Project identity and display labels
+Organisation ID
+Time zone, currency, and unit set
+Basic intervals and operation modes
+Default interval
+Configuration version and activation metadata
+Snapshot schema version
+```
+
+Later operational slices extend the versioned snapshot schema with the applicable groups below;
+foundation activation must omit those groups rather than invent placeholders.
+
 ```text
 Project identity
 Organisation/client/operator
@@ -26,8 +42,8 @@ Configuration version and activation metadata
 
 ## Snapshot rules
 
-- created at daily-report creation and refreshed only through an explicit action while draft
-- frozen at submission
+- created and frozen when a configuration version is activated
+- bound immutably to a new daily-report revision at creation; a later activation does not rebind it
 - does not include secrets or unnecessary personal identifiers
 - stores display labels as well as IDs
 - includes effective price and unit context

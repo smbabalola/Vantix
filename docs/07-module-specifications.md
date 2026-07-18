@@ -43,6 +43,16 @@ Create the stable identity and operational context for daily reporting.
 - a new version is created for changes
 - report references the version active when the day was created or explicitly refreshed
 - interval detail fields beyond the observed context require product confirmation
+- foundation activation requires project identity, time zone, currency, unit set, one basic interval,
+  a default interval, and an operation mode
+- a basic interval contains only ID, name, operation mode, and optional measured-depth bounds
+- optional depth bounds use the canonical value contract with decimal string, unit, and entered
+  provenance; when both are present they use the same unit and bottom MD is greater than top MD
+- omitted source-gap interval fields remain absent and are never defaulted to zero
+- activation atomically freezes the structured configuration, checksum, activation actor/time, and
+  current project pointers; the previously active version becomes superseded
+- changing active setup begins by copying it into a new mutable draft version
+- configuration draft updates use optimistic concurrency and produce audit events
 
 ### Report contribution
 

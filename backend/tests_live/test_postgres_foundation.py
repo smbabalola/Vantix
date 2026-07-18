@@ -14,6 +14,9 @@ from app.db import SessionFactory, set_tenant_context
 from app.main import app
 from app.models import (
     AuditEvent,
+    ConfigurationSnapshot,
+    ConfigurationVersion,
+    DailyReport,
     DailyReportRevision,
     Project,
     ReportPayload,
@@ -21,6 +24,7 @@ from app.models import (
 from app.postgres_repository import PostgresFoundationRepository
 from app.schemas import (
     ConfigurationCreate,
+    ConfigurationPatch,
     DailyReportCreate,
     DecisionRequest,
     DraftPatch,
@@ -35,6 +39,22 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
 ALL_CAPABILITIES = frozenset(Capability)
+
+
+def valid_configuration(name: str = "Drilling interval") -> ConfigurationCreate:
+    interval_id = uuid4()
+    return ConfigurationCreate(
+        data={
+            "default_interval_id": str(interval_id),
+            "intervals": [
+                {
+                    "id": str(interval_id),
+                    "name": name,
+                    "operation_mode": "drilling",
+                }
+            ],
+        }
+    )
 
 
 def context(user_id: UUID | None = None, organisation_id: UUID | None = None) -> AuthContext:
@@ -119,9 +139,7 @@ def prepare_report(
     configuration = repository.create_configuration(
         auth,
         project.id,
-        ConfigurationCreate(
-            data={"project": {"name": "North Sea A"}, "unit_set": {"name": "Field"}}
-        ),
+        valid_configuration(),
     )
     repository.activate_configuration(auth, project.id, configuration.id, "activate-foundation")
     report = repository.create_daily_report(
@@ -150,6 +168,194 @@ def prepare_report(
             DraftPatch(expected_version=report.revision.version, data=value),
         )
     return project, report
+
+
+def prepare_project(repository: PostgresFoundationRepository, auth: AuthContext):
+    repository.create_organisation(auth, OrganisationCreate(name="Vantix Config Org"))
+    return repository.create_project(
+        auth,
+        ProjectCreate(
+            project_code="CFG-01",
+            project_name="Configuration Project",
+            well_name="Well-01",
+            time_zone="Europe/London",
+            currency="GBP",
+            unit_set="Metric",
+        ),
+        auth.organisation_id,
+    )
+
+
+def test_vtx_prj_002_readiness_blocks_activation_atomically() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = repository.create_configuration(
+        auth, project.id, ConfigurationCreate(copy_active=False)
+    )
+
+    readiness = repository.validate_configuration(auth, project.id, configuration.id)
+    assert readiness.can_activate is False
+    assert {issue["code"] for issue in readiness.issues} == {
+        "DEFAULT_INTERVAL_REQUIRED",
+        "INTERVAL_REQUIRED",
+    }
+    with pytest.raises(HTTPException) as error:
+        repository.activate_configuration(auth, project.id, configuration.id, "not-ready")
+    assert error.value.status_code == 422
+
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with engine.connect() as connection:
+        assert connection.scalar(select(ConfigurationSnapshot.id)) is None
+        stored_state = connection.scalar(
+            select(ConfigurationVersion.state).where(ConfigurationVersion.id == configuration.id)
+        )
+        assert stored_state == "draft"
+    engine.dispose()
+
+
+def test_vtx_prj_003_004_activation_is_immutable_versioned_and_idempotent() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    first = repository.create_configuration(auth, project.id, valid_configuration("Surface"))
+    active = repository.activate_configuration(auth, project.id, first.id, "activate-v1")
+    retried = repository.activate_configuration(auth, project.id, first.id, "activate-v1")
+    assert retried.snapshot_id == active.snapshot_id
+    assert retried.checksum == active.checksum
+
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            update(ConfigurationVersion)
+            .where(ConfigurationVersion.id == first.id)
+            .values(data={"intervals": []})
+        )
+
+    copied = repository.create_configuration(auth, project.id, ConfigurationCreate())
+    assert copied.version == 2
+    assert copied.data == first.data
+    interval_id = copied.data["intervals"][0]["id"]
+    revised_data = {
+        "default_interval_id": interval_id,
+        "intervals": [
+            {
+                "id": interval_id,
+                "name": "Production interval",
+                "operation_mode": "drilling",
+            }
+        ],
+    }
+    saved = repository.patch_configuration(
+        auth,
+        project.id,
+        copied.id,
+        ConfigurationPatch(expected_version=1, data=revised_data),
+    )
+    assert saved.row_version == 2
+    with pytest.raises(HTTPException) as conflict:
+        repository.patch_configuration(
+            auth,
+            project.id,
+            copied.id,
+            ConfigurationPatch(expected_version=1, data=revised_data),
+        )
+    assert conflict.value.status_code == 412
+
+    with pytest.raises(HTTPException) as reused_key:
+        repository.activate_configuration(auth, project.id, copied.id, "activate-v1")
+    assert reused_key.value.status_code == 409
+
+    second = repository.activate_configuration(auth, project.id, copied.id, "activate-v2")
+    assert second.snapshot_id != active.snapshot_id
+    with engine.connect() as connection:
+        states = dict(
+            connection.execute(
+                select(ConfigurationVersion.id, ConfigurationVersion.state).where(
+                    ConfigurationVersion.id.in_([first.id, copied.id])
+                )
+            ).all()
+        )
+    engine.dispose()
+    assert states == {first.id: "superseded", copied.id: "active"}
+
+
+def test_vtx_prj_005_report_revisions_retain_their_configuration_snapshot() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    first = repository.create_configuration(auth, project.id, valid_configuration("First"))
+    active_first = repository.activate_configuration(auth, project.id, first.id, "first")
+    report_one = repository.create_daily_report(
+        auth,
+        project.id,
+        DailyReportCreate(report_date="2026-07-18", report_number="CFG-1"),
+        "report-one",
+    )
+
+    second = repository.create_configuration(auth, project.id, ConfigurationCreate())
+    active_second = repository.activate_configuration(auth, project.id, second.id, "second")
+    report_two = repository.create_daily_report(
+        auth,
+        project.id,
+        DailyReportCreate(report_date="2026-07-19", report_number="CFG-2"),
+        "report-two",
+    )
+
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with engine.connect() as connection:
+        bindings = dict(
+            connection.execute(
+                select(DailyReport.id, DailyReport.active_configuration_snapshot_id).where(
+                    DailyReport.id.in_([report_one.id, report_two.id])
+                )
+            ).all()
+        )
+    engine.dispose()
+    assert bindings[report_one.id] == active_first.snapshot_id
+    assert bindings[report_two.id] == active_second.snapshot_id
+
+
+def test_vtx_prj_006_configuration_reads_are_tenant_isolated() -> None:
+    repository = PostgresFoundationRepository()
+    owner = context()
+    project = prepare_project(repository, owner)
+    repository.create_configuration(owner, project.id, valid_configuration())
+
+    outsider = context()
+    repository.create_organisation(outsider, OrganisationCreate(name="Other Org"))
+    with pytest.raises(HTTPException) as error:
+        repository.list_configurations(outsider, project.id)
+    assert error.value.status_code == 404
+
+
+def test_vtx_prj_001_organisation_admin_can_manage_all_organisation_projects() -> None:
+    repository = PostgresFoundationRepository()
+    owner = context()
+    project = prepare_project(repository, owner)
+    repository.create_configuration(owner, project.id, valid_configuration())
+    administrator = context(organisation_id=owner.organisation_id)
+
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, external_subject, status) VALUES (:id, :subject, 'active')"
+            ),
+            {"id": administrator.user_id, "subject": f"test:{administrator.user_id}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO organisation_memberships "
+                "(organisation_id, user_id, role, status) "
+                "VALUES (:org, :user, 'organisation_admin', 'active')"
+            ),
+            {"org": owner.organisation_id, "user": administrator.user_id},
+        )
+    engine.dispose()
+
+    assert [item.id for item in repository.list_projects(administrator)] == [project.id]
+    assert len(repository.list_configurations(administrator, project.id)) == 1
 
 
 def test_vtx_mvp_003_vtx_auth_004_005_live_rls_blocks_cross_tenant_access() -> None:
@@ -595,7 +801,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0004_harden_revision_transitions"
+            "0005_project_config_lifecycle"
         )
         flags = connection.execute(
             text(
@@ -607,6 +813,22 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
         ).one()
         assert flags == (True, True)
     engine.dispose()
+
+
+def test_vtx_mvp_001_alembic_metadata_has_no_schema_drift() -> None:
+    environment = {
+        **os.environ,
+        "VANTIX_DATABASE_URL": os.environ["VANTIX_ADMIN_DATABASE_URL"],
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "check"],
+        check=True,
+        cwd=os.getcwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert "No new upgrade operations detected" in result.stdout
 
 
 def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:
@@ -663,7 +885,9 @@ def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:
                       +
                       (SELECT count(*) FROM pg_proc
                        WHERE proname IN (
-                         'vantix_guard_revision_mutation', 'vantix_reject_mutation'
+                         'vantix_guard_revision_mutation',
+                         'vantix_guard_configuration_mutation',
+                         'vantix_reject_mutation'
                        ))
                     """
                 )

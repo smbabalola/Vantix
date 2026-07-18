@@ -3,9 +3,9 @@
 Vantix is an auditable drilling-fluids operations and reporting platform. The V2 files under
 `docs/`, `contracts/`, `.qodo/agents/`, and `scripts/` are the authoritative specification.
 
-## Foundation lifecycle status
+## Implemented vertical slices
 
-The `feature/foundation-report-lifecycle-v1` branch implements the first vertical slice:
+The foundation lifecycle is complete and hardened:
 
 - organisation membership, project, and active configuration snapshot
 - business day and optimistic-concurrency draft revision
@@ -16,6 +16,17 @@ The `feature/foundation-report-lifecycle-v1` branch implements the first vertica
 - membership-bound PostgreSQL RLS and database immutability triggers
 - client-view filtering for internal comments
 - IndexedDB caching for mutable draft patches only
+
+The project-configuration snapshot slice adds:
+
+- organisation-scoped project creation and authorised project reads
+- versioned foundation configuration drafts with optimistic concurrency
+- server-evaluated activation readiness for project identity and basic intervals
+- optional measured-depth values with explicit units and entered provenance
+- immutable canonical snapshots with checksums, actor, and activation time
+- superseded configuration history and copied revision drafts
+- immutable configuration-snapshot binding on every new report revision
+- a responsive configuration workspace with honest unavailable-value states
 
 PostgreSQL is the default runtime repository. The in-memory adapter remains only as an explicit
 test dependency override. Submission readiness, version checking, state transition, frozen
@@ -67,7 +78,5 @@ be `NOSUPERUSER NOBYPASSRLS` and have normal schema, table, sequence, and functi
   object-storage upload and authorised download-link delivery are not implemented.
 - Draft caching is local-only; background synchronisation and broader offline operation remain out
   of MVP scope.
-- Products, inventory, pits/volumes, and fluid checks are deliberately deferred until subsequent
+- Products, inventory, pits/volumes, and fluid checks remain deliberately deferred to subsequent
   vertical slices.
-
-The next branch after foundation acceptance is `feature/project-configuration-snapshot-v1`.
