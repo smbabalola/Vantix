@@ -98,6 +98,12 @@ def test_vtx_pro_004_005_inventory_postings_are_append_only_rls_guarded_and_reve
     assert "inventory_ledger_lines_guard" in INVENTORY_LEDGER
     assert "posted inventory is append-only" in INVENTORY_LEDGER
     assert "reversal line must exactly negate frozen original" in INVENTORY_LEDGER
+    assert "currency_minor_unit_scale" in INVENTORY_LEDGER
+    assert "sa.Numeric(30, 12)" in INVENTORY_LEDGER
+    assert "pg_advisory_xact_lock" in INVENTORY_LEDGER
+    assert "inventory product or snapshot authority mismatch" in INVENTORY_LEDGER
+    assert "canonical inventory quantity mismatch" in INVENTORY_LEDGER
+    assert "posted inventory amount mismatch" in INVENTORY_LEDGER
     assert "FORCE ROW LEVEL SECURITY" in INVENTORY_LEDGER
     downgrade = INVENTORY_LEDGER.split("def downgrade()", maxsplit=1)[1]
     assert "DROP FUNCTION IF EXISTS vantix_guard_inventory_line()" in downgrade

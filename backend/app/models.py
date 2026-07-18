@@ -305,8 +305,11 @@ class InventoryLedgerLine(TenantMixin, Base):
     price_status: Mapped[str] = mapped_column(String(20), nullable=False)
     applied_unit_price: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
     price_basis_unit_code: Mapped[str | None] = mapped_column(String(20))
+    price_effective_from: Mapped[date | None] = mapped_column(Date)
+    price_effective_to: Mapped[date | None] = mapped_column(Date)
     currency: Mapped[str | None] = mapped_column(String(3))
-    posted_line_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 3))
+    currency_minor_unit_scale: Mapped[int | None] = mapped_column(Integer)
+    posted_line_amount: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     frozen_product_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     __table_args__ = (
         UniqueConstraint("posting_id", "product_definition_id", name="uq_inventory_line_product"),
@@ -316,10 +319,12 @@ class InventoryLedgerLine(TenantMixin, Base):
         CheckConstraint(
             "(price_status = 'ready' AND product_price_version_id IS NOT NULL AND "
             "applied_unit_price IS NOT NULL AND price_basis_unit_code IS NOT NULL AND "
-            "currency IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
+            "price_effective_from IS NOT NULL AND currency IS NOT NULL AND "
+            "currency_minor_unit_scale IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
             "(price_status = 'unavailable' AND product_price_version_id IS NULL AND "
-            "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND currency IS NULL AND "
-            "posted_line_amount IS NULL)",
+            "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND "
+            "price_effective_from IS NULL AND price_effective_to IS NULL AND currency IS NULL AND "
+            "currency_minor_unit_scale IS NULL AND posted_line_amount IS NULL)",
             name="ck_inventory_lines_price_completeness",
         ),
         CheckConstraint(

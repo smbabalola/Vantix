@@ -6,6 +6,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -19,6 +20,7 @@ from app.models import (
     ConfigurationVersion,
     DailyReport,
     DailyReportRevision,
+    IdempotencyRecord,
     InventoryLedgerLine,
     InventoryPosting,
     Project,
@@ -34,6 +36,7 @@ from app.schemas import (
     DecisionRequest,
     DraftPatch,
     ExportRequest,
+    InventoryPostingView,
     InventoryReversalCreate,
     OpeningStockCreate,
     OpeningStockLineCreate,
@@ -45,7 +48,7 @@ from app.schemas import (
 )
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, func, select, text, update
+from sqlalchemy import create_engine, delete, func, insert, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
@@ -1654,6 +1657,7 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
     product = authority.products[0]
     request = OpeningStockCreate(
+        expected_configuration_snapshot_id=authority.configuration_snapshot_id,
         posting_date="2026-07-18",
         lines=[
             OpeningStockLineCreate(
@@ -1666,7 +1670,7 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     posted = repository.post_opening_stock(auth, project.id, request, "opening-live-1")
     assert posted.lines[0].canonical_signed_quantity == "100"
     assert posted.lines[0].applied_unit_price == "18.5"
-    assert posted.lines[0].posted_line_amount == "74"
+    assert posted.lines[0].posted_line_amount == "74.00"
     assert (
         repository.post_opening_stock(auth, project.id, request, "opening-live-1").id == posted.id
     )
@@ -1707,7 +1711,7 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     )
     historical = repository.list_inventory_postings(auth, project.id)[0]
     assert historical.lines[0].applied_unit_price == "18.5"
-    assert historical.lines[0].posted_line_amount == "74"
+    assert historical.lines[0].posted_line_amount == "74.00"
 
     reversal = repository.reverse_inventory_posting(
         auth,
@@ -1724,7 +1728,7 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     )
     assert reversal.lines[0].product_price_version_id == posted.lines[0].product_price_version_id
     assert reversal.lines[0].canonical_signed_quantity == "-100"
-    assert reversal.lines[0].posted_line_amount == "-74"
+    assert reversal.lines[0].posted_line_amount == "-74.00"
 
     admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with pytest.raises(DBAPIError), admin.begin() as connection:
@@ -1743,6 +1747,21 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
         connection.execute(
             delete(InventoryLedgerLine).where(InventoryLedgerLine.id == posted.lines[0].id)
         )
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=posted.source_configuration_snapshot_id,
+                posting_type="reversal",
+                status="building",
+                posting_date=date(2026, 7, 20),
+                reversal_of_posting_id=posted.id,
+                reason="Forged second reversal",
+                posted_by=auth.user_id,
+            )
+        )
     admin.dispose()
 
 
@@ -1757,6 +1776,7 @@ def test_vtx_auth_004_inventory_tables_enforce_cross_tenant_rls() -> None:
         auth,
         project.id,
         OpeningStockCreate(
+            expected_configuration_snapshot_id=authority.configuration_snapshot_id,
             posting_date="2026-07-18",
             lines=[
                 OpeningStockLineCreate(
@@ -1784,6 +1804,375 @@ def test_vtx_auth_004_inventory_tables_enforce_cross_tenant_rls() -> None:
         )
         assert session.scalar(select(func.count()).select_from(InventoryPosting)) == 0
         assert session.scalar(select(func.count()).select_from(InventoryLedgerLine)) == 0
+
+
+def test_vtx_pro_004_stale_reviewed_snapshot_rolls_back_posting_idempotency_and_audit() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    first = create_configuration(repository, auth, project.id, valid_configuration())
+    activate_configuration(repository, auth, project.id, first.id, "activate-stale-v1")
+    old_authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    stale_request = OpeningStockCreate(
+        expected_configuration_snapshot_id=old_authority.configuration_snapshot_id,
+        posting_date="2026-07-18",
+        lines=[
+            OpeningStockLineCreate(
+                product_definition_id=old_authority.products[0].product_definition_id,
+                entered_quantity="4",
+                entered_unit_code="package",
+            )
+        ],
+    )
+    second = create_configuration(
+        repository, auth, project.id, ConfigurationCreate(copy_active=True), "stale-v2"
+    )
+    copied_product = repository.list_products(auth, project.id, second.id)[0]
+    copied_price = copied_product.prices[0]
+    changed = repository.patch_product_price(
+        auth,
+        copied_price.id,
+        ProductPricePatch(
+            expected_configuration_version=second.row_version,
+            effective_from=copied_price.effective_from,
+            effective_to=copied_price.effective_to,
+            unit_price="24",
+            currency="GBP",
+            price_basis_unit_code="package",
+        ),
+    )
+    readiness = repository.validate_configuration(auth, project.id, second.id)
+    repository.activate_configuration(
+        auth,
+        project.id,
+        second.id,
+        "activate-stale-v2",
+        changed.configuration_row_version,
+        readiness.draft_checksum,
+    )
+    audit_before = len(repository.audit_events(auth, project.id))
+    with pytest.raises(HTTPException) as stale:
+        repository.post_opening_stock(auth, project.id, stale_request, "stale-reviewed-opening")
+    assert stale.value.status_code == 412
+    assert stale.value.detail["code"] == "INVENTORY_AUTHORITY_CHANGED"
+    assert repository.list_inventory_postings(auth, project.id) == []
+    assert len(repository.audit_events(auth, project.id)) == audit_before
+    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with admin.connect() as connection:
+        assert (
+            connection.scalar(
+                select(func.count())
+                .select_from(IdempotencyRecord)
+                .where(IdempotencyRecord.operation_type == "post_opening_stock")
+            )
+            == 0
+        )
+    admin.dispose()
+
+
+def test_vtx_pro_005_concurrent_opening_occupancy_is_per_product_lineage() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    barite = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=configuration.row_version,
+            item_code="BAR-001",
+            item_name="Barite",
+            packaging="sack",
+            package_size="25",
+            package_unit_code="kg",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+            specific_gravity="4.2",
+        ),
+    )
+    barite = repository.create_product_price(
+        auth,
+        barite.id,
+        ProductPriceCreate(
+            expected_configuration_version=barite.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="18.50",
+            currency="GBP",
+            price_basis_unit_code="package",
+        ),
+    )
+    bentonite = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=barite.configuration_row_version,
+            item_code="BEN-001",
+            item_name="Bentonite",
+            packaging="sack",
+            package_size="25",
+            package_unit_code="kg",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+            specific_gravity="2.6",
+        ),
+    )
+    repository.create_product_price(
+        auth,
+        bentonite.id,
+        ProductPriceCreate(
+            expected_configuration_version=bentonite.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="22.00",
+            currency="GBP",
+            price_basis_unit_code="package",
+        ),
+    )
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-two-products"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    definitions = {
+        product.item_code: product.product_definition_id for product in authority.products
+    }
+
+    def post(definition_id: UUID, key: str) -> InventoryPostingView | str:
+        try:
+            return repository.post_opening_stock(
+                auth,
+                project.id,
+                OpeningStockCreate(
+                    expected_configuration_snapshot_id=active.snapshot_id,
+                    posting_date="2026-07-18",
+                    lines=[
+                        OpeningStockLineCreate(
+                            product_definition_id=definition_id,
+                            entered_quantity="1",
+                            entered_unit_code="package",
+                        )
+                    ],
+                ),
+                key,
+            )
+        except HTTPException as exc:
+            return str(exc.detail["code"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        disjoint = list(
+            executor.map(
+                lambda args: post(*args),
+                [
+                    (definitions["BAR-001"], "open-barite"),
+                    (definitions["BEN-001"], "open-bentonite"),
+                ],
+            )
+        )
+    assert all(not isinstance(result, str) for result in disjoint)
+    for index, result in enumerate(disjoint):
+        assert not isinstance(result, str)
+        repository.reverse_inventory_posting(
+            auth,
+            project.id,
+            result.id,
+            InventoryReversalCreate(posting_date="2026-07-19", reason="Reset concurrency fixture"),
+            f"reverse-disjoint-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        duplicate = list(
+            executor.map(
+                lambda key: post(definitions["BAR-001"], key),
+                ["same-lineage-a", "same-lineage-b"],
+            )
+        )
+    assert sum(not isinstance(result, str) for result in duplicate) == 1
+    assert duplicate.count("OPENING_STOCK_PRODUCT_ALREADY_POSTED") == 1
+    refreshed = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    opened = {product.item_code: product.opened_by_posting_id for product in refreshed.products}
+    assert opened["BAR-001"] is not None
+    assert opened["BEN-001"] is None
+
+
+def test_vtx_cst_001_four_decimal_currency_survives_posting_and_reversal_exactly() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    repository.create_organisation(auth, OrganisationCreate(name="Four Decimal Org"))
+    project = repository.create_project(
+        auth,
+        ProjectCreate(
+            project_code="CLF-01",
+            project_name="Four Decimal Project",
+            well_name="Well-CLF",
+            time_zone="America/Santiago",
+            currency="CLF",
+            unit_set="Metric",
+        ),
+        auth.organisation_id,
+    )
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    product = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=configuration.row_version,
+            item_code="EA-001",
+            item_name="Counted additive",
+            packaging="each",
+            package_size="1",
+            package_unit_code="each",
+            inventory_applicable=True,
+            inventory_unit_code="each",
+        ),
+    )
+    repository.create_product_price(
+        auth,
+        product.id,
+        ProductPriceCreate(
+            expected_configuration_version=product.configuration_row_version,
+            effective_from="2026-01-01",
+            unit_price="1.2345",
+            currency="CLF",
+            price_basis_unit_code="each",
+        ),
+    )
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-four-decimal"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
+    request = OpeningStockCreate(
+        expected_configuration_snapshot_id=active.snapshot_id,
+        posting_date="2026-07-18",
+        lines=[
+            OpeningStockLineCreate(
+                product_definition_id=authority.products[0].product_definition_id,
+                entered_quantity="3",
+                entered_unit_code="each",
+            )
+        ],
+    )
+    preview = repository.preview_opening_stock(auth, project.id, request)
+    assert preview.lines[0].line_amount == "3.7035"
+    assert preview.currencies == {"CLF": "3.7035"}
+    posted = repository.post_opening_stock(auth, project.id, request, "four-decimal-open")
+    assert posted.lines[0].currency_minor_unit_scale == 4
+    assert posted.lines[0].posted_line_amount == "3.7035"
+    reversed_posting = repository.reverse_inventory_posting(
+        auth,
+        project.id,
+        posted.id,
+        InventoryReversalCreate(posting_date="2026-07-19", reason="Four-decimal test"),
+        "four-decimal-reverse",
+    )
+    assert reversed_posting.lines[0].currency_minor_unit_scale == 4
+    assert reversed_posting.lines[0].posted_line_amount == "-3.7035"
+
+
+def test_vtx_pro_004_database_rejects_forged_frozen_opening_authority() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    first = create_configuration(repository, auth, project.id, valid_configuration())
+    active = activate_configuration(repository, auth, project.id, first.id, "activate-forgery-v1")
+    assert active.snapshot_id is not None
+    v1_product = repository.list_products(auth, project.id, first.id)[0]
+    v1_price = v1_product.prices[0]
+    second = create_configuration(
+        repository, auth, project.id, ConfigurationCreate(copy_active=True), "forgery-v2"
+    )
+    v2_product = repository.list_products(auth, project.id, second.id)[0]
+    v2_price = v2_product.prices[0]
+    frozen_product = {
+        "item_code": v1_product.item_code,
+        "item_name": v1_product.item_name,
+        "alternate_name": v1_product.alternate_name,
+        "packaging": v1_product.packaging,
+        "package_size": v1_product.package_size,
+        "package_unit_code": v1_product.package_unit_code,
+        "inventory_unit_code": v1_product.inventory_unit_code,
+        "specific_gravity": v1_product.specific_gravity,
+    }
+    base_line: dict[str, Any] = {
+        "organisation_id": auth.organisation_id,
+        "project_id": project.id,
+        "product_definition_id": v1_product.product_definition_id,
+        "configuration_product_version_id": v1_product.id,
+        "product_price_version_id": v1_price.id,
+        "entered_quantity": Decimal("4"),
+        "entered_unit_code": "package",
+        "canonical_signed_quantity": Decimal("100"),
+        "canonical_unit_code": "kg",
+        "price_status": "ready",
+        "applied_unit_price": Decimal("18.5"),
+        "price_basis_unit_code": "package",
+        "price_effective_from": date(2026, 1, 1),
+        "price_effective_to": None,
+        "currency": "GBP",
+        "currency_minor_unit_scale": 2,
+        "posted_line_amount": Decimal("74.00"),
+        "frozen_product_json": frozen_product,
+    }
+    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    other_project = repository.create_project(
+        auth,
+        ProjectCreate(
+            project_code="FORGE-02",
+            project_name="Other project",
+            well_name="Other well",
+            time_zone="Europe/London",
+            currency="GBP",
+            unit_set="Metric",
+        ),
+        auth.organisation_id,
+    )
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=other_project.id,
+                source_configuration_snapshot_id=active.snapshot_id,
+                posting_type="opening_stock",
+                status="building",
+                posting_date=date(2026, 7, 18),
+                reversal_of_posting_id=None,
+                reason=None,
+                posted_by=auth.user_id,
+            )
+        )
+
+    def assert_rejected(**overrides: Any) -> None:
+        posting_id = uuid4()
+        line_values = {**base_line, **overrides, "id": uuid4(), "posting_id": posting_id}
+        with pytest.raises(DBAPIError), admin.begin() as connection:
+            connection.execute(
+                insert(InventoryPosting).values(
+                    id=posting_id,
+                    organisation_id=auth.organisation_id,
+                    project_id=project.id,
+                    source_configuration_snapshot_id=active.snapshot_id,
+                    posting_type="opening_stock",
+                    status="building",
+                    posting_date=date(2026, 7, 18),
+                    reversal_of_posting_id=None,
+                    reason=None,
+                    posted_by=auth.user_id,
+                )
+            )
+            connection.execute(insert(InventoryLedgerLine).values(**line_values))
+
+    assert_rejected(
+        configuration_product_version_id=v2_product.id,
+        product_price_version_id=v2_price.id,
+    )
+    assert_rejected(product_price_version_id=v2_price.id)
+    assert_rejected(frozen_product_json={**frozen_product, "package_size": "50"})
+    assert_rejected(canonical_signed_quantity=Decimal("999"))
+    assert_rejected(posted_line_amount=Decimal("999.00"))
+    admin.dispose()
 
 
 def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:

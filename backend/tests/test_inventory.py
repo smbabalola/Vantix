@@ -79,6 +79,8 @@ def test_vtx_rec_004_015_reversal_is_exact_opposite_without_repricing() -> None:
         product={"package_size": "25", "package_unit_code": "kg"},
         price={
             "id": "00000000-0000-4000-8000-000000000001",
+            "effective_from": "2026-01-01",
+            "effective_to": None,
             "unit_price": "18.5",
             "price_basis_unit_code": "package",
             "currency": "GBP",

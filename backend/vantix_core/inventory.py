@@ -81,6 +81,14 @@ def decimal_string(value: Decimal) -> str:
     return "0" if value == 0 else format(value.normalize(), "f")
 
 
+def currency_minor_unit_scale(currency: str) -> int:
+    return CURRENCY_MINOR_UNITS.get(currency, 2)
+
+
+def money_string(value: Decimal, scale: int) -> str:
+    return format(value, f".{scale}f")
+
+
 def convert_opening_quantity(
     entered_quantity: str,
     entered_unit_code: str,
@@ -126,6 +134,29 @@ def convert_opening_quantity(
     return decimal_string(canonical), CANONICAL_UNITS[package_dimension]
 
 
+def calculate_package_count(
+    canonical_quantity: str, *, package_size: str, package_unit_code: str
+) -> str:
+    canonical = _decimal(
+        canonical_quantity,
+        code="CANONICAL_QUANTITY_INVALID",
+        field="canonical_quantity",
+        positive=True,
+    )
+    package_quantity = _decimal(
+        package_size,
+        code="PACKAGE_SIZE_INVALID",
+        field="package_size",
+        positive=True,
+    )
+    factor = UNIT_TO_CANONICAL.get(package_unit_code)
+    if factor is None:
+        raise InventoryValidationError(
+            "PACKAGE_UNIT_UNRECOGNISED", "package_unit_code", "Package unit is unsupported."
+        )
+    return decimal_string(canonical / (package_quantity * factor))
+
+
 def calculate_posted_amount(
     canonical_quantity: str,
     *,
@@ -167,7 +198,7 @@ def calculate_posted_amount(
                 "Price basis must match package content or be per package.",
             )
         basis_quantity = canonical / UNIT_TO_CANONICAL[price_basis_unit_code]
-    scale = CURRENCY_MINOR_UNITS.get(currency, 2)
+    scale = currency_minor_unit_scale(currency)
     quantum = Decimal(1).scaleb(-scale)
     return format((basis_quantity * price).quantize(quantum, rounding=ROUND_HALF_UP), f".{scale}f")
 
@@ -195,6 +226,9 @@ def build_opening_line(
         "applied_unit_price": None,
         "price_basis_unit_code": None,
         "currency": None,
+        "currency_minor_unit_scale": None,
+        "price_effective_from": None,
+        "price_effective_to": None,
         "posted_line_amount": None,
     }
     if price is not None:
@@ -205,6 +239,11 @@ def build_opening_line(
                 "applied_unit_price": decimal_string(Decimal(str(price["unit_price"]))),
                 "price_basis_unit_code": str(price["price_basis_unit_code"]),
                 "currency": str(price["currency"]),
+                "currency_minor_unit_scale": currency_minor_unit_scale(str(price["currency"])),
+                "price_effective_from": str(price["effective_from"]),
+                "price_effective_to": (
+                    str(price["effective_to"]) if price.get("effective_to") is not None else None
+                ),
                 "posted_line_amount": calculate_posted_amount(
                     canonical_quantity,
                     price_basis_unit_code=str(price["price_basis_unit_code"]),
@@ -227,7 +266,10 @@ def build_reversal_line(line: Mapping[str, Any]) -> dict[str, Any]:
         -Decimal(str(line["canonical_signed_quantity"]))
     )
     amount = line.get("posted_line_amount")
+    scale = line.get("currency_minor_unit_scale")
     result["posted_line_amount"] = (
-        decimal_string(-Decimal(str(amount))) if amount is not None else None
+        money_string(-Decimal(str(amount)), int(scale))
+        if amount is not None and scale is not None
+        else None
     )
     return result

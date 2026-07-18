@@ -90,8 +90,11 @@ def upgrade() -> None:
         sa.Column("price_status", sa.String(20), nullable=False),
         sa.Column("applied_unit_price", sa.Numeric(24, 12)),
         sa.Column("price_basis_unit_code", sa.String(20)),
+        sa.Column("price_effective_from", sa.Date()),
+        sa.Column("price_effective_to", sa.Date()),
         sa.Column("currency", sa.String(3)),
-        sa.Column("posted_line_amount", sa.Numeric(24, 3)),
+        sa.Column("currency_minor_unit_scale", sa.Integer()),
+        sa.Column("posted_line_amount", sa.Numeric(30, 12)),
         sa.Column("frozen_product_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.ForeignKeyConstraint(["project_id"], ["projects.id"]),
         sa.ForeignKeyConstraint(["posting_id"], ["inventory_postings.id"]),
@@ -107,10 +110,12 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "(price_status = 'ready' AND product_price_version_id IS NOT NULL AND "
             "applied_unit_price IS NOT NULL AND price_basis_unit_code IS NOT NULL AND "
-            "currency IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
+            "price_effective_from IS NOT NULL AND currency IS NOT NULL AND "
+            "currency_minor_unit_scale IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
             "(price_status = 'unavailable' AND product_price_version_id IS NULL AND "
-            "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND currency IS NULL "
-            "AND posted_line_amount IS NULL)",
+            "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND "
+            "price_effective_from IS NULL AND price_effective_to IS NULL AND currency IS NULL "
+            "AND currency_minor_unit_scale IS NULL AND posted_line_amount IS NULL)",
             name="ck_inventory_lines_price_completeness",
         ),
         sa.CheckConstraint(
@@ -180,14 +185,6 @@ def upgrade() -> None:
             RAISE EXCEPTION 'inventory snapshot ownership mismatch';
           END IF;
           PERFORM pg_advisory_xact_lock(hashtextextended(NEW.project_id::text, 0));
-          IF NEW.posting_type = 'opening_stock' AND EXISTS (
-            SELECT 1 FROM inventory_postings opening
-             WHERE opening.project_id = NEW.project_id AND opening.posting_type = 'opening_stock'
-               AND opening.status = 'posted'
-               AND NOT EXISTS (SELECT 1 FROM inventory_postings reversal
-                 WHERE reversal.reversal_of_posting_id = opening.id AND reversal.status = 'posted')) THEN
-            RAISE EXCEPTION 'project already has unreversed opening stock';
-          END IF;
           IF NEW.posting_type = 'reversal' THEN
             SELECT * INTO original FROM inventory_postings WHERE id = NEW.reversal_of_posting_id;
             IF NOT FOUND OR original.project_id <> NEW.project_id OR original.organisation_id <> NEW.organisation_id
@@ -203,8 +200,21 @@ def upgrade() -> None:
           FOR EACH ROW EXECUTE FUNCTION vantix_guard_inventory_posting();
 
         CREATE FUNCTION vantix_guard_inventory_line() RETURNS trigger LANGUAGE plpgsql AS $$
-        DECLARE parent inventory_postings%ROWTYPE; product project_products%ROWTYPE;
-          definition project_product_definitions%ROWTYPE; original_line inventory_ledger_lines%ROWTYPE;
+        DECLARE
+          parent inventory_postings%ROWTYPE;
+          product project_products%ROWTYPE;
+          definition project_product_definitions%ROWTYPE;
+          price product_price_history%ROWTYPE;
+          original_line inventory_ledger_lines%ROWTYPE;
+          snapshot_configuration_id uuid;
+          entered_factor numeric;
+          package_factor numeric;
+          basis_factor numeric;
+          expected_canonical numeric;
+          expected_amount numeric;
+          expected_scale integer;
+          package_dimension text;
+          entered_dimension text;
         BEGIN
           IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'inventory ledger lines are immutable'; END IF;
           SELECT * INTO parent FROM inventory_postings WHERE id = NEW.posting_id;
@@ -212,18 +222,123 @@ def upgrade() -> None:
              OR parent.organisation_id <> NEW.organisation_id THEN
             RAISE EXCEPTION 'ledger lines require a matching building posting';
           END IF;
+          SELECT configuration_version_id INTO snapshot_configuration_id
+            FROM project_configuration_snapshots
+           WHERE id = parent.source_configuration_snapshot_id;
           SELECT * INTO product FROM project_products WHERE id = NEW.configuration_product_version_id;
           SELECT * INTO definition FROM project_product_definitions WHERE id = NEW.product_definition_id;
           IF product.id IS NULL OR definition.id IS NULL
+             OR product.configuration_version_id <> snapshot_configuration_id
              OR product.product_definition_id <> NEW.product_definition_id
              OR product.project_id <> NEW.project_id OR definition.project_id <> NEW.project_id
-             OR product.organisation_id <> NEW.organisation_id THEN
-            RAISE EXCEPTION 'inventory product ownership mismatch';
+             OR product.organisation_id <> NEW.organisation_id
+             OR definition.organisation_id <> NEW.organisation_id
+             OR NOT product.inventory_applicable OR NOT product.active THEN
+            RAISE EXCEPTION 'inventory product or snapshot authority mismatch';
           END IF;
-          IF parent.posting_type = 'opening_stock' AND (NEW.entered_quantity <= 0 OR NEW.canonical_signed_quantity <= 0) THEN
-            RAISE EXCEPTION 'opening quantity must be positive';
+
+          IF NEW.frozen_product_json ->> 'item_code' IS DISTINCT FROM product.item_code
+             OR NEW.frozen_product_json ->> 'item_name' IS DISTINCT FROM product.item_name
+             OR NEW.frozen_product_json ->> 'alternate_name' IS DISTINCT FROM product.alternate_name
+             OR NEW.frozen_product_json ->> 'packaging' IS DISTINCT FROM product.packaging
+             OR (NEW.frozen_product_json ->> 'package_size')::numeric <> product.package_size
+             OR NEW.frozen_product_json ->> 'package_unit_code' <> product.package_unit_code
+             OR NEW.frozen_product_json ->> 'inventory_unit_code' IS DISTINCT FROM product.inventory_unit_code
+             OR NULLIF(NEW.frozen_product_json ->> 'specific_gravity', '')::numeric
+                IS DISTINCT FROM product.specific_gravity THEN
+            RAISE EXCEPTION 'frozen product authority mismatch';
           END IF;
-          IF parent.posting_type = 'reversal' THEN
+
+          package_factor := CASE product.package_unit_code
+            WHEN 'kg' THEN 1 WHEN 't' THEN 1000 WHEN 'lb' THEN 0.45359237
+            WHEN 'L' THEN 1 WHEN 'm3' THEN 1000 WHEN 'gal_us' THEN 3.785411784
+            WHEN 'bbl' THEN 158.987294928 WHEN 'each' THEN 1 END;
+          package_dimension := CASE
+            WHEN product.package_unit_code IN ('kg','t','lb') THEN 'mass'
+            WHEN product.package_unit_code IN ('L','m3','gal_us','bbl') THEN 'volume'
+            ELSE 'count' END;
+          entered_factor := CASE NEW.entered_unit_code
+            WHEN 'kg' THEN 1 WHEN 't' THEN 1000 WHEN 'lb' THEN 0.45359237
+            WHEN 'L' THEN 1 WHEN 'm3' THEN 1000 WHEN 'gal_us' THEN 3.785411784
+            WHEN 'bbl' THEN 158.987294928 WHEN 'each' THEN 1 END;
+          entered_dimension := CASE
+            WHEN NEW.entered_unit_code IN ('kg','t','lb') THEN 'mass'
+            WHEN NEW.entered_unit_code IN ('L','m3','gal_us','bbl') THEN 'volume'
+            WHEN NEW.entered_unit_code = 'each' THEN 'count' ELSE 'package' END;
+          IF NEW.entered_unit_code <> 'package' AND entered_dimension <> package_dimension THEN
+            RAISE EXCEPTION 'entered inventory unit dimension mismatch';
+          END IF;
+          expected_canonical := CASE WHEN NEW.entered_unit_code = 'package'
+            THEN NEW.entered_quantity * product.package_size * package_factor
+            ELSE NEW.entered_quantity * entered_factor END;
+          IF NEW.canonical_signed_quantity <> expected_canonical
+             OR NEW.canonical_unit_code <> (CASE package_dimension
+               WHEN 'mass' THEN 'kg' WHEN 'volume' THEN 'L' ELSE 'each' END) THEN
+            RAISE EXCEPTION 'canonical inventory quantity mismatch';
+          END IF;
+
+          IF parent.posting_type = 'opening_stock' THEN
+            IF NEW.entered_quantity <= 0 OR NEW.canonical_signed_quantity <= 0 THEN
+              RAISE EXCEPTION 'opening quantity must be positive';
+            END IF;
+            PERFORM pg_advisory_xact_lock(hashtextextended(NEW.product_definition_id::text, 0));
+            IF EXISTS (
+              SELECT 1 FROM inventory_ledger_lines existing_line
+              JOIN inventory_postings opening ON opening.id = existing_line.posting_id
+              WHERE existing_line.product_definition_id = NEW.product_definition_id
+                AND opening.project_id = NEW.project_id
+                AND opening.posting_type = 'opening_stock' AND opening.status = 'posted'
+                AND NOT EXISTS (SELECT 1 FROM inventory_postings reversal
+                  WHERE reversal.reversal_of_posting_id = opening.id
+                    AND reversal.status = 'posted')) THEN
+              RAISE EXCEPTION 'product already has unreversed opening stock';
+            END IF;
+
+            IF NEW.price_status = 'ready' THEN
+              SELECT * INTO price FROM product_price_history WHERE id = NEW.product_price_version_id;
+              IF NOT FOUND OR price.project_product_id <> product.id
+                 OR price.project_id <> NEW.project_id OR price.organisation_id <> NEW.organisation_id
+                 OR price.effective_from > parent.posting_date
+                 OR (price.effective_to IS NOT NULL AND price.effective_to <= parent.posting_date)
+                 OR NEW.applied_unit_price <> price.unit_price
+                 OR NEW.price_basis_unit_code <> price.price_basis_unit_code
+                 OR NEW.price_effective_from <> price.effective_from
+                 OR NEW.price_effective_to IS DISTINCT FROM price.effective_to
+                 OR NEW.currency <> price.currency THEN
+                RAISE EXCEPTION 'frozen price authority mismatch';
+              END IF;
+              expected_scale := CASE price.currency
+                WHEN 'BIF' THEN 0 WHEN 'CLF' THEN 4 WHEN 'CLP' THEN 0
+                WHEN 'DJF' THEN 0 WHEN 'GNF' THEN 0 WHEN 'ISK' THEN 0
+                WHEN 'JPY' THEN 0 WHEN 'KMF' THEN 0 WHEN 'KRW' THEN 0
+                WHEN 'PYG' THEN 0 WHEN 'RWF' THEN 0 WHEN 'UGX' THEN 0
+                WHEN 'UYI' THEN 0 WHEN 'UYW' THEN 4 WHEN 'VND' THEN 0
+                WHEN 'VUV' THEN 0 WHEN 'XAF' THEN 0 WHEN 'XOF' THEN 0
+                WHEN 'XPF' THEN 0 WHEN 'BHD' THEN 3 WHEN 'IQD' THEN 3
+                WHEN 'JOD' THEN 3 WHEN 'KWD' THEN 3 WHEN 'LYD' THEN 3
+                WHEN 'OMR' THEN 3 WHEN 'TND' THEN 3 ELSE 2 END;
+              IF NEW.currency_minor_unit_scale <> expected_scale THEN
+                RAISE EXCEPTION 'currency minor-unit scale mismatch';
+              END IF;
+              basis_factor := CASE price.price_basis_unit_code
+                WHEN 'kg' THEN 1 WHEN 't' THEN 1000 WHEN 'lb' THEN 0.45359237
+                WHEN 'L' THEN 1 WHEN 'm3' THEN 1000 WHEN 'gal_us' THEN 3.785411784
+                WHEN 'bbl' THEN 158.987294928 WHEN 'each' THEN 1 END;
+              expected_amount := CASE WHEN price.price_basis_unit_code = 'package'
+                THEN expected_canonical / (product.package_size * package_factor) * price.unit_price
+                ELSE expected_canonical / basis_factor * price.unit_price END;
+              IF NEW.posted_line_amount <> round(expected_amount, expected_scale) THEN
+                RAISE EXCEPTION 'posted inventory amount mismatch';
+              END IF;
+            ELSIF EXISTS (
+              SELECT 1 FROM product_price_history effective_price
+               WHERE effective_price.project_product_id = product.id
+                 AND effective_price.effective_from <= parent.posting_date
+                 AND (effective_price.effective_to IS NULL
+                   OR effective_price.effective_to > parent.posting_date)) THEN
+              RAISE EXCEPTION 'effective price cannot be recorded as unavailable';
+            END IF;
+          ELSE
             SELECT * INTO original_line FROM inventory_ledger_lines
              WHERE posting_id = parent.reversal_of_posting_id
                AND product_definition_id = NEW.product_definition_id;
@@ -236,7 +351,10 @@ def upgrade() -> None:
                OR NEW.price_status <> original_line.price_status
                OR NEW.applied_unit_price IS DISTINCT FROM original_line.applied_unit_price
                OR NEW.price_basis_unit_code IS DISTINCT FROM original_line.price_basis_unit_code
+               OR NEW.price_effective_from IS DISTINCT FROM original_line.price_effective_from
+               OR NEW.price_effective_to IS DISTINCT FROM original_line.price_effective_to
                OR NEW.currency IS DISTINCT FROM original_line.currency
+               OR NEW.currency_minor_unit_scale IS DISTINCT FROM original_line.currency_minor_unit_scale
                OR NEW.posted_line_amount IS DISTINCT FROM -original_line.posted_line_amount
                OR NEW.frozen_product_json <> original_line.frozen_product_json THEN
               RAISE EXCEPTION 'reversal line must exactly negate frozen original';

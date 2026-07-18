@@ -172,6 +172,7 @@ class OpeningStockAuthorityProduct(BaseModel):
     package_unit_code: PackageContentUnitCode
     inventory_unit_code: ProductUnitCode
     price: ProductPriceView | None
+    opened_by_posting_id: UUID | None = None
 
 
 class OpeningStockAuthorityView(BaseModel):
@@ -188,8 +189,39 @@ class OpeningStockLineCreate(BaseModel):
 
 
 class OpeningStockCreate(BaseModel):
+    expected_configuration_snapshot_id: UUID
     posting_date: date
     lines: list[OpeningStockLineCreate] = Field(min_length=1)
+
+
+class OpeningStockPreviewLine(BaseModel):
+    product_definition_id: UUID
+    configuration_product_version_id: UUID
+    item_code: str
+    item_name: str
+    entered_quantity: str
+    entered_unit_code: ProductUnitCode
+    package_size: str
+    package_unit_code: PackageContentUnitCode
+    canonical_quantity: str
+    canonical_unit_code: Literal["kg", "L", "each"]
+    package_count: str
+    price_status: Literal["ready", "unavailable"]
+    applied_unit_price: str | None
+    price_basis_unit_code: ProductUnitCode | None
+    price_effective_from: date | None
+    price_effective_to: date | None
+    currency: str | None
+    currency_minor_unit_scale: int | None
+    line_amount: str | None
+
+
+class OpeningStockPreviewView(BaseModel):
+    project_id: UUID
+    posting_date: date
+    configuration_snapshot_id: UUID
+    lines: list[OpeningStockPreviewLine]
+    currencies: dict[str, str]
 
 
 class InventoryReversalCreate(BaseModel):
@@ -209,7 +241,10 @@ class InventoryLedgerLineView(BaseModel):
     price_status: Literal["ready", "unavailable"]
     applied_unit_price: str | None
     price_basis_unit_code: ProductUnitCode | None
+    price_effective_from: date | None
+    price_effective_to: date | None
     currency: str | None
+    currency_minor_unit_scale: int | None
     posted_line_amount: str | None
     frozen_product: dict[str, Any]
 

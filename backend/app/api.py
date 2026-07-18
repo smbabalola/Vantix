@@ -6,12 +6,19 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from vantix_core.canonical import payload_checksum
-from vantix_core.inventory import InventoryValidationError, build_opening_line, build_reversal_line
+from vantix_core.inventory import (
+    InventoryValidationError,
+    build_opening_line,
+    build_reversal_line,
+    calculate_package_count,
+    money_string,
+)
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
     DailyReport,
@@ -51,6 +58,8 @@ from .schemas import (
     OpeningStockAuthorityProduct,
     OpeningStockAuthorityView,
     OpeningStockCreate,
+    OpeningStockPreviewLine,
+    OpeningStockPreviewView,
     OrganisationCreate,
     OrganisationView,
     ProductPriceCreate,
@@ -855,6 +864,145 @@ def _memory_active_products(
     ]
 
 
+def _memory_opened_definitions(repository: FoundationStore, project_id: UUID) -> dict[UUID, UUID]:
+    result: dict[UUID, UUID] = {}
+    for posting in repository.inventory_postings.values():
+        if (
+            posting["project_id"] != project_id
+            or posting["posting_type"] != "opening_stock"
+            or posting.get("reversal_posting_id") is not None
+        ):
+            continue
+        for line in posting["lines"]:
+            result[UUID(str(line["product_definition_id"]))] = cast(UUID, posting["id"])
+    return result
+
+
+def _memory_resolve_opening_lines(
+    repository: FoundationStore, project: ProjectRecord, body: OpeningStockCreate
+) -> list[dict[str, Any]]:
+    if (
+        project.active_snapshot is None
+        or project.active_snapshot.id != body.expected_configuration_snapshot_id
+    ):
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "INVENTORY_AUTHORITY_CHANGED"},
+        )
+    products = {
+        UUID(str(item["product_definition_id"])): item
+        for item in _memory_active_products(repository, project)
+    }
+    if len(body.lines) != len({line.product_definition_id for line in body.lines}):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "DUPLICATE_OPENING_PRODUCT"}
+        )
+    if any(line.product_definition_id not in products for line in body.lines):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "OPENING_PRODUCT_NOT_AUTHORISED"},
+        )
+    resolved: list[dict[str, Any]] = []
+    for requested in body.lines:
+        product = products[requested.product_definition_id]
+        price = select_effective_price(
+            [
+                value
+                for value in repository.product_prices.values()
+                if value["project_product_id"] == product["id"]
+            ],
+            body.posting_date,
+        )
+        frozen_product = {
+            key: product.get(key)
+            for key in (
+                "item_code",
+                "item_name",
+                "alternate_name",
+                "packaging",
+                "package_size",
+                "package_unit_code",
+                "inventory_unit_code",
+                "specific_gravity",
+            )
+        }
+        try:
+            frozen = build_opening_line(
+                entered_quantity=requested.entered_quantity,
+                entered_unit_code=requested.entered_unit_code,
+                product=frozen_product,
+                price=price,
+            )
+            package_count = calculate_package_count(
+                frozen["canonical_signed_quantity"],
+                package_size=str(frozen_product["package_size"]),
+                package_unit_code=str(frozen_product["package_unit_code"]),
+            )
+        except InventoryValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": exc.code, "message": str(exc), "field": exc.field},
+            ) from exc
+        resolved.append(
+            {
+                "product": product,
+                "frozen_product": frozen_product,
+                "frozen": frozen,
+                "package_count": package_count,
+            }
+        )
+    return resolved
+
+
+def _memory_preview(
+    project_id: UUID, body: OpeningStockCreate, resolved: list[dict[str, Any]]
+) -> OpeningStockPreviewView:
+    totals: dict[str, Decimal] = {}
+    scales: dict[str, int] = {}
+    lines: list[OpeningStockPreviewLine] = []
+    for item in resolved:
+        product = item["product"]
+        frozen = item["frozen"]
+        if frozen["posted_line_amount"] is not None:
+            currency = frozen["currency"]
+            totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
+                frozen["posted_line_amount"]
+            )
+            scales[currency] = frozen["currency_minor_unit_scale"]
+        lines.append(
+            OpeningStockPreviewLine(
+                product_definition_id=product["product_definition_id"],
+                configuration_product_version_id=product["id"],
+                item_code=product["item_code"],
+                item_name=product["item_name"],
+                entered_quantity=frozen["entered_quantity"],
+                entered_unit_code=frozen["entered_unit_code"],
+                package_size=str(item["frozen_product"]["package_size"]),
+                package_unit_code=item["frozen_product"]["package_unit_code"],
+                canonical_quantity=frozen["canonical_signed_quantity"],
+                canonical_unit_code=frozen["canonical_unit_code"],
+                package_count=item["package_count"],
+                price_status=frozen["price_status"],
+                applied_unit_price=frozen["applied_unit_price"],
+                price_basis_unit_code=frozen["price_basis_unit_code"],
+                price_effective_from=frozen["price_effective_from"],
+                price_effective_to=frozen["price_effective_to"],
+                currency=frozen["currency"],
+                currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
+                line_amount=frozen["posted_line_amount"],
+            )
+        )
+    return OpeningStockPreviewView(
+        project_id=project_id,
+        posting_date=body.posting_date,
+        configuration_snapshot_id=body.expected_configuration_snapshot_id,
+        lines=lines,
+        currencies={
+            currency: money_string(amount, scales[currency]) for currency, amount in totals.items()
+        },
+    )
+
+
 @router.get(
     "/projects/{project_id}/inventory/opening-stock-authority",
     response_model=OpeningStockAuthorityView,
@@ -874,6 +1022,7 @@ def opening_stock_authority(
         _memory_active_products(repository, project), key=lambda item: str(item["item_code"])
     )
     assert project.active_snapshot is not None
+    opened = _memory_opened_definitions(repository, project_id)
     return OpeningStockAuthorityView(
         project_id=project_id,
         posting_date=posting_date,
@@ -887,6 +1036,7 @@ def opening_stock_authority(
                 package_size=str(product["package_size"]),
                 package_unit_code=product["package_unit_code"],
                 inventory_unit_code=product["inventory_unit_code"],
+                opened_by_posting_id=opened.get(UUID(str(product["product_definition_id"]))),
                 price=(
                     ProductPriceView.model_validate(selected)
                     if (
@@ -904,6 +1054,32 @@ def opening_stock_authority(
             )
             for product in products
         ],
+    )
+
+
+@router.post(
+    "/projects/{project_id}/inventory-postings/opening-stock/preview",
+    response_model=OpeningStockPreviewView,
+)
+def preview_opening_stock(
+    project_id: UUID,
+    body: OpeningStockCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> OpeningStockPreviewView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.preview_opening_stock(auth, project_id, body)
+    if not auth.capabilities.intersection({Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "CAPABILITY_DENIED"})
+    project = _project(project_id, auth, repository)
+    occupied = _memory_opened_definitions(repository, project_id)
+    if any(line.product_definition_id in occupied for line in body.lines):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "OPENING_STOCK_PRODUCT_ALREADY_POSTED"},
+        )
+    return _memory_preview(
+        project_id, body, _memory_resolve_opening_lines(repository, project, body)
     )
 
 
@@ -926,66 +1102,21 @@ def post_opening_stock(
     request_hash = _request_hash({"project_id": str(project_id), **body.model_dump(mode="json")})
 
     def post() -> InventoryPostingView:
-        if any(
-            item["project_id"] == project_id
-            and item["posting_type"] == "opening_stock"
-            and item.get("reversal_posting_id") is None
-            for item in repository.inventory_postings.values()
-        ):
+        occupied = _memory_opened_definitions(repository, project_id)
+        if any(line.product_definition_id in occupied for line in body.lines):
             raise HTTPException(
-                status.HTTP_409_CONFLICT, detail={"code": "OPENING_STOCK_ALREADY_POSTED"}
+                status.HTTP_409_CONFLICT,
+                detail={"code": "OPENING_STOCK_PRODUCT_ALREADY_POSTED"},
             )
-        products = {
-            UUID(str(item["product_definition_id"])): item
-            for item in _memory_active_products(repository, project)
-        }
-        if len(body.lines) != len({line.product_definition_id for line in body.lines}):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "DUPLICATE_OPENING_PRODUCT"}
-            )
-        if any(line.product_definition_id not in products for line in body.lines):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"code": "OPENING_PRODUCT_NOT_AUTHORISED"},
-            )
+        resolved = _memory_resolve_opening_lines(repository, project, body)
         assert project.active_snapshot is not None
         posting_id = uuid4()
         now = datetime.now(UTC)
         lines: list[dict[str, Any]] = []
-        for request_line in body.lines:
-            product = products[request_line.product_definition_id]
-            price = select_effective_price(
-                [
-                    value
-                    for value in repository.product_prices.values()
-                    if value["project_product_id"] == product["id"]
-                ],
-                body.posting_date,
-            )
-            frozen_product = {
-                key: product.get(key)
-                for key in (
-                    "item_code",
-                    "item_name",
-                    "packaging",
-                    "package_size",
-                    "package_unit_code",
-                    "inventory_unit_code",
-                    "specific_gravity",
-                )
-            }
-            try:
-                frozen = build_opening_line(
-                    entered_quantity=request_line.entered_quantity,
-                    entered_unit_code=request_line.entered_unit_code,
-                    product=frozen_product,
-                    price=price,
-                )
-            except InventoryValidationError as exc:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"code": exc.code, "message": str(exc), "field": exc.field},
-                ) from exc
+        for item in resolved:
+            product = item["product"]
+            frozen_product = item["frozen_product"]
+            frozen = item["frozen"]
             line_id = uuid4()
             line = {
                 "id": line_id,

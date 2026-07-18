@@ -17,7 +17,13 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
-from vantix_core.inventory import InventoryValidationError, build_opening_line, build_reversal_line
+from vantix_core.inventory import (
+    InventoryValidationError,
+    build_opening_line,
+    build_reversal_line,
+    calculate_package_count,
+    money_string,
+)
 from vantix_core.products import (
     ProductValidationError,
     canonicalise_product,
@@ -73,6 +79,8 @@ from .schemas import (
     OpeningStockAuthorityProduct,
     OpeningStockAuthorityView,
     OpeningStockCreate,
+    OpeningStockPreviewLine,
+    OpeningStockPreviewView,
     OrganisationCreate,
     OrganisationView,
     ProductPriceCreate,
@@ -1176,10 +1184,14 @@ class PostgresFoundationRepository:
                 else None
             ),
             price_basis_unit_code=cast(Any, line.price_basis_unit_code),
+            price_effective_from=line.price_effective_from,
+            price_effective_to=line.price_effective_to,
             currency=line.currency,
+            currency_minor_unit_scale=line.currency_minor_unit_scale,
             posted_line_amount=(
-                cls._decimal_string(line.posted_line_amount)
+                money_string(line.posted_line_amount, line.currency_minor_unit_scale)
                 if line.posted_line_amount is not None
+                and line.currency_minor_unit_scale is not None
                 else None
             ),
             frozen_product=deepcopy(line.frozen_product_json),
@@ -1222,6 +1234,183 @@ class PostgresFoundationRepository:
             detail={"code": exc.code, "message": str(exc), "field": exc.field},
         )
 
+    @staticmethod
+    def _opened_inventory_definitions(session: Session, project_id: UUID) -> dict[UUID, UUID]:
+        openings = session.scalars(
+            select(InventoryPosting).where(
+                InventoryPosting.project_id == project_id,
+                InventoryPosting.posting_type == "opening_stock",
+                InventoryPosting.status == "posted",
+            )
+        ).all()
+        result: dict[UUID, UUID] = {}
+        for opening in openings:
+            reversed_id = session.scalar(
+                select(InventoryPosting.id).where(
+                    InventoryPosting.reversal_of_posting_id == opening.id,
+                    InventoryPosting.status == "posted",
+                )
+            )
+            if reversed_id is not None:
+                continue
+            definition_ids = session.scalars(
+                select(InventoryLedgerLine.product_definition_id).where(
+                    InventoryLedgerLine.posting_id == opening.id
+                )
+            ).all()
+            result.update({definition_id: opening.id for definition_id in definition_ids})
+        return result
+
+    def _resolve_opening_lines(
+        self,
+        session: Session,
+        project: Project,
+        body: OpeningStockCreate,
+    ) -> list[dict[str, Any]]:
+        snapshot = session.scalar(
+            select(ConfigurationSnapshot).where(
+                ConfigurationSnapshot.id == body.expected_configuration_snapshot_id,
+                ConfigurationSnapshot.project_id == project.id,
+            )
+        )
+        if snapshot is None:
+            raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
+        definition_ids = [line.product_definition_id for line in body.lines]
+        if len(definition_ids) != len(set(definition_ids)):
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "DUPLICATE_OPENING_PRODUCT")
+        products = session.scalars(
+            select(ProjectProduct).where(
+                ProjectProduct.configuration_version_id == snapshot.configuration_version_id,
+                ProjectProduct.product_definition_id.in_(definition_ids),
+                ProjectProduct.inventory_applicable.is_(True),
+                ProjectProduct.active.is_(True),
+            )
+        ).all()
+        by_definition = {product.product_definition_id: product for product in products}
+        if set(by_definition) != set(definition_ids):
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "OPENING_PRODUCT_NOT_AUTHORISED")
+        resolved: list[dict[str, Any]] = []
+        for requested in body.lines:
+            product = by_definition[requested.product_definition_id]
+            price = session.scalar(
+                select(ProductPrice)
+                .where(
+                    ProductPrice.project_product_id == product.id,
+                    ProductPrice.effective_from <= body.posting_date,
+                    (
+                        ProductPrice.effective_to.is_(None)
+                        | (ProductPrice.effective_to > body.posting_date)
+                    ),
+                )
+                .order_by(ProductPrice.effective_from.desc())
+                .limit(1)
+            )
+            frozen_product = {
+                "item_code": product.item_code,
+                "item_name": product.item_name,
+                "alternate_name": product.alternate_name,
+                "packaging": product.packaging,
+                "package_size": self._decimal_string(product.package_size),
+                "package_unit_code": product.package_unit_code,
+                "inventory_unit_code": product.inventory_unit_code,
+                "specific_gravity": (
+                    self._decimal_string(product.specific_gravity)
+                    if product.specific_gravity is not None
+                    else None
+                ),
+            }
+            price_authority = (
+                {
+                    "id": price.id,
+                    "effective_from": price.effective_from,
+                    "effective_to": price.effective_to,
+                    "unit_price": price.unit_price,
+                    "price_basis_unit_code": price.price_basis_unit_code,
+                    "currency": price.currency,
+                }
+                if price
+                else None
+            )
+            try:
+                frozen = build_opening_line(
+                    entered_quantity=requested.entered_quantity,
+                    entered_unit_code=requested.entered_unit_code,
+                    product=frozen_product,
+                    price=price_authority,
+                )
+                package_count = calculate_package_count(
+                    frozen["canonical_signed_quantity"],
+                    package_size=cast(str, frozen_product["package_size"]),
+                    package_unit_code=cast(str, frozen_product["package_unit_code"]),
+                )
+            except InventoryValidationError as exc:
+                raise self._inventory_error(exc) from exc
+            resolved.append(
+                {
+                    "product": product,
+                    "price": price,
+                    "frozen_product": frozen_product,
+                    "frozen": frozen,
+                    "package_count": package_count,
+                }
+            )
+        return resolved
+
+    @staticmethod
+    def _preview_view(
+        project: Project, body: OpeningStockCreate, resolved: list[dict[str, Any]]
+    ) -> OpeningStockPreviewView:
+        totals: dict[str, Decimal] = {}
+        lines: list[OpeningStockPreviewLine] = []
+        for item in resolved:
+            product = cast(ProjectProduct, item["product"])
+            frozen = cast(dict[str, Any], item["frozen"])
+            if frozen["posted_line_amount"] is not None:
+                currency = cast(str, frozen["currency"])
+                totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
+                    frozen["posted_line_amount"]
+                )
+            lines.append(
+                OpeningStockPreviewLine(
+                    product_definition_id=product.product_definition_id,
+                    configuration_product_version_id=product.id,
+                    item_code=product.item_code,
+                    item_name=product.item_name,
+                    entered_quantity=frozen["entered_quantity"],
+                    entered_unit_code=cast(Any, frozen["entered_unit_code"]),
+                    package_size=item["frozen_product"]["package_size"],
+                    package_unit_code=cast(Any, item["frozen_product"]["package_unit_code"]),
+                    canonical_quantity=frozen["canonical_signed_quantity"],
+                    canonical_unit_code=cast(Any, frozen["canonical_unit_code"]),
+                    package_count=item["package_count"],
+                    price_status=cast(Any, frozen["price_status"]),
+                    applied_unit_price=frozen["applied_unit_price"],
+                    price_basis_unit_code=cast(Any, frozen["price_basis_unit_code"]),
+                    price_effective_from=frozen["price_effective_from"],
+                    price_effective_to=frozen["price_effective_to"],
+                    currency=frozen["currency"],
+                    currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
+                    line_amount=frozen["posted_line_amount"],
+                )
+            )
+        currency_scales = {
+            cast(str, item["frozen"]["currency"]): cast(
+                int, item["frozen"]["currency_minor_unit_scale"]
+            )
+            for item in resolved
+            if item["frozen"]["currency"] is not None
+        }
+        return OpeningStockPreviewView(
+            project_id=project.id,
+            posting_date=body.posting_date,
+            configuration_snapshot_id=body.expected_configuration_snapshot_id,
+            lines=lines,
+            currencies={
+                currency: money_string(amount, currency_scales[currency])
+                for currency, amount in sorted(totals.items())
+            },
+        )
+
     def opening_stock_authority(
         self, auth: AuthContext, project_id: UUID, posting_date: date
     ) -> OpeningStockAuthorityView:
@@ -1247,6 +1436,7 @@ class PostgresFoundationRepository:
                 )
                 .order_by(ProjectProduct.item_code, ProjectProduct.id)
             ).all()
+            opened = self._opened_inventory_definitions(session, project_id)
             authority_products: list[OpeningStockAuthorityProduct] = []
             for product in products:
                 prices = session.scalars(
@@ -1268,6 +1458,7 @@ class PostgresFoundationRepository:
                         package_unit_code=cast(Any, product.package_unit_code),
                         inventory_unit_code=cast(Any, product.inventory_unit_code),
                         price=ProductPriceView.model_validate(selected) if selected else None,
+                        opened_by_posting_id=opened.get(product.product_definition_id),
                     )
                 )
             return OpeningStockAuthorityView(
@@ -1276,6 +1467,32 @@ class PostgresFoundationRepository:
                 configuration_snapshot_id=project.current_configuration_snapshot_id,
                 products=authority_products,
             )
+
+    def preview_opening_stock(
+        self, auth: AuthContext, project_id: UUID, body: OpeningStockCreate
+    ) -> OpeningStockPreviewView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = self._project(session, auth, project_id)
+            capabilities = self._database_capabilities(session, auth, project_id)
+            if not capabilities.intersection(
+                {Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            if project.current_configuration_snapshot_id != body.expected_configuration_snapshot_id:
+                raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
+            occupied = self._opened_inventory_definitions(session, project_id)
+            conflict = next(
+                (
+                    line.product_definition_id
+                    for line in body.lines
+                    if line.product_definition_id in occupied
+                ),
+                None,
+            )
+            if conflict is not None:
+                raise _error(status.HTTP_409_CONFLICT, "OPENING_STOCK_PRODUCT_ALREADY_POSTED")
+            resolved = self._resolve_opening_lines(session, project, body)
+            return self._preview_view(project, body, resolved)
 
     def post_opening_stock(
         self,
@@ -1306,6 +1523,8 @@ class PostgresFoundationRepository:
                 or not project.current_configuration_snapshot_id
             ):
                 raise _error(status.HTTP_409_CONFLICT, "ACTIVE_CONFIGURATION_REQUIRED")
+            if project.current_configuration_snapshot_id != body.expected_configuration_snapshot_id:
+                raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
             definition_ids = [line.product_definition_id for line in body.lines]
             if len(definition_ids) != len(set(definition_ids)):
                 raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "DUPLICATE_OPENING_PRODUCT")
@@ -1315,36 +1534,10 @@ class PostgresFoundationRepository:
                 .order_by(ProductDefinition.id)
                 .with_for_update()
             ).all()
-            opening_ids = session.scalars(
-                select(InventoryPosting.id).where(
-                    InventoryPosting.project_id == project_id,
-                    InventoryPosting.posting_type == "opening_stock",
-                    InventoryPosting.status == "posted",
-                )
-            ).all()
-            if any(
-                session.scalar(
-                    select(InventoryPosting.id).where(
-                        InventoryPosting.reversal_of_posting_id == opening_id,
-                        InventoryPosting.status == "posted",
-                    )
-                )
-                is None
-                for opening_id in opening_ids
-            ):
-                raise _error(status.HTTP_409_CONFLICT, "OPENING_STOCK_ALREADY_POSTED")
-            products = session.scalars(
-                select(ProjectProduct).where(
-                    ProjectProduct.configuration_version_id
-                    == project.current_configuration_version_id,
-                    ProjectProduct.product_definition_id.in_(definition_ids),
-                    ProjectProduct.inventory_applicable.is_(True),
-                    ProjectProduct.active.is_(True),
-                )
-            ).all()
-            by_definition = {product.product_definition_id: product for product in products}
-            if set(by_definition) != set(definition_ids):
-                raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "OPENING_PRODUCT_NOT_AUTHORISED")
+            occupied = self._opened_inventory_definitions(session, project_id)
+            if any(definition_id in occupied for definition_id in definition_ids):
+                raise _error(status.HTTP_409_CONFLICT, "OPENING_STOCK_PRODUCT_ALREADY_POSTED")
+            resolved = self._resolve_opening_lines(session, project, body)
             posting = InventoryPosting(
                 id=uuid4(),
                 organisation_id=auth.organisation_id,
@@ -1359,52 +1552,11 @@ class PostgresFoundationRepository:
             )
             session.add(posting)
             session.flush()
-            for requested in body.lines:
-                product = by_definition[requested.product_definition_id]
-                price = session.scalar(
-                    select(ProductPrice)
-                    .where(
-                        ProductPrice.project_product_id == product.id,
-                        ProductPrice.effective_from <= body.posting_date,
-                        (
-                            ProductPrice.effective_to.is_(None)
-                            | (ProductPrice.effective_to > body.posting_date)
-                        ),
-                    )
-                    .order_by(ProductPrice.effective_from.desc())
-                    .limit(1)
-                )
-                frozen_product = {
-                    "item_code": product.item_code,
-                    "item_name": product.item_name,
-                    "packaging": product.packaging,
-                    "package_size": self._decimal_string(product.package_size),
-                    "package_unit_code": product.package_unit_code,
-                    "inventory_unit_code": product.inventory_unit_code,
-                    "specific_gravity": (
-                        self._decimal_string(product.specific_gravity)
-                        if product.specific_gravity is not None
-                        else None
-                    ),
-                }
-                try:
-                    frozen = build_opening_line(
-                        entered_quantity=requested.entered_quantity,
-                        entered_unit_code=requested.entered_unit_code,
-                        product=frozen_product,
-                        price=(
-                            {
-                                "id": price.id,
-                                "unit_price": price.unit_price,
-                                "price_basis_unit_code": price.price_basis_unit_code,
-                                "currency": price.currency,
-                            }
-                            if price
-                            else None
-                        ),
-                    )
-                except InventoryValidationError as exc:
-                    raise self._inventory_error(exc) from exc
+            for item in resolved:
+                product = cast(ProjectProduct, item["product"])
+                price = cast(ProductPrice | None, item["price"])
+                frozen_product = cast(dict[str, Any], item["frozen_product"])
+                frozen = cast(dict[str, Any], item["frozen"])
                 session.add(
                     InventoryLedgerLine(
                         id=uuid4(),
@@ -1425,7 +1577,18 @@ class PostgresFoundationRepository:
                             else None
                         ),
                         price_basis_unit_code=frozen["price_basis_unit_code"],
+                        price_effective_from=(
+                            date.fromisoformat(frozen["price_effective_from"])
+                            if frozen["price_effective_from"]
+                            else None
+                        ),
+                        price_effective_to=(
+                            date.fromisoformat(frozen["price_effective_to"])
+                            if frozen["price_effective_to"]
+                            else None
+                        ),
                         currency=frozen["currency"],
+                        currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
                         posted_line_amount=(
                             Decimal(frozen["posted_line_amount"])
                             if frozen["posted_line_amount"]
@@ -1533,6 +1696,7 @@ class PostgresFoundationRepository:
                             if original_line.posted_line_amount is not None
                             else None
                         ),
+                        "currency_minor_unit_scale": original_line.currency_minor_unit_scale,
                     }
                 )
                 session.add(
@@ -1551,7 +1715,10 @@ class PostgresFoundationRepository:
                         price_status=original_line.price_status,
                         applied_unit_price=original_line.applied_unit_price,
                         price_basis_unit_code=original_line.price_basis_unit_code,
+                        price_effective_from=original_line.price_effective_from,
+                        price_effective_to=original_line.price_effective_to,
                         currency=original_line.currency,
+                        currency_minor_unit_scale=original_line.currency_minor_unit_scale,
                         posted_line_amount=(
                             Decimal(frozen["posted_line_amount"])
                             if frozen["posted_line_amount"]

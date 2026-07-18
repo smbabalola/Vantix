@@ -2,6 +2,7 @@ from uuid import UUID, uuid4
 
 from app.store import FoundationStore
 from fastapi.testclient import TestClient
+from vantix_core.lifecycle import ConfigurationSnapshot
 
 
 def headers(user_id=None, organisation_id=None, capabilities="") -> dict[str, str]:
@@ -137,6 +138,7 @@ def test_vtx_pro_004_005_opening_stock_is_idempotent_and_historically_frozen(
     )
     product = authority.json()["products"][0]
     request = {
+        "expected_configuration_snapshot_id": authority.json()["configuration_snapshot_id"],
         "posting_date": "2026-07-18",
         "lines": [
             {
@@ -146,6 +148,16 @@ def test_vtx_pro_004_005_opening_stock_is_idempotent_and_historically_frozen(
             }
         ],
     }
+    preview = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock/preview",
+        headers=inventory_headers,
+        json=request,
+    )
+    assert preview.status_code == 200
+    assert preview.json()["lines"][0]["canonical_quantity"] == "100"
+    assert preview.json()["lines"][0]["package_count"] == "4"
+    assert preview.json()["lines"][0]["line_amount"] == "74.00"
+    assert preview.json()["currencies"] == {"GBP": "74.00"}
     posted = client.post(
         f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
         headers=inventory_headers,
@@ -196,6 +208,7 @@ def test_vtx_rec_004_opening_reversal_is_exact_and_preserves_original(
         f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
         headers={**inventory_headers, "Idempotency-Key": "opening-stock-reverse"},
         json={
+            "expected_configuration_snapshot_id": authority["configuration_snapshot_id"],
             "posting_date": "2026-07-18",
             "lines": [
                 {
@@ -213,12 +226,50 @@ def test_vtx_rec_004_opening_reversal_is_exact_and_preserves_original(
     )
     assert reversal.status_code == 201
     assert reversal.json()["lines"][0]["canonical_signed_quantity"] == "-100"
-    assert reversal.json()["lines"][0]["posted_line_amount"] == "-74"
+    assert reversal.json()["lines"][0]["posted_line_amount"] == "-74.00"
     history = client.get(
         f"/api/v1/projects/{project['id']}/inventory-postings", headers=inventory_headers
     ).json()
     assert len(history) == 2
     assert history[0]["reversal_posting_id"] == reversal.json()["id"]
+
+
+def test_vtx_pro_004_stale_reviewed_authority_creates_no_memory_posting_or_idempotency(
+    client: TestClient, foundation_store: FoundationStore
+) -> None:
+    _, _, editor_headers, project, _ = setup_report(client)
+    headers_with_inventory = {
+        **editor_headers,
+        "X-Vantix-Capabilities": "view_inventory,post_inventory",
+        "Idempotency-Key": "stale-opening-authority",
+    }
+    authority = client.get(
+        f"/api/v1/projects/{project['id']}/inventory/opening-stock-authority",
+        headers=headers_with_inventory,
+        params={"posting_date": "2026-07-18"},
+    ).json()
+    project_id = UUID(project["id"])
+    project_record = foundation_store.projects[project_id]
+    project_record.active_snapshot = ConfigurationSnapshot.create(project_id, 2, {"products": []})
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/opening-stock",
+        headers=headers_with_inventory,
+        json={
+            "expected_configuration_snapshot_id": authority["configuration_snapshot_id"],
+            "posting_date": "2026-07-18",
+            "lines": [
+                {
+                    "product_definition_id": authority["products"][0]["product_definition_id"],
+                    "entered_quantity": "4",
+                    "entered_unit_code": "package",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 412
+    assert response.json()["detail"]["code"] == "INVENTORY_AUTHORITY_CHANGED"
+    assert foundation_store.inventory_postings == {}
+    assert not any(key[1] == "post_opening_stock" for key in foundation_store.idempotency)
 
 
 def test_vtx_api_003_cross_tenant_project_returns_no_data(client: TestClient) -> None:
