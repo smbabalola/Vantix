@@ -1,6 +1,8 @@
 import type {
   ConfigurationReadiness,
   GeneralSection,
+  InventoryPosting,
+  OpeningStockAuthority,
   Project,
   ProjectConfiguration,
   ProjectProduct,
@@ -184,6 +186,46 @@ export const api = {
     return request(session, `/product-prices/${priceId}`, {
       method: "DELETE",
       body: JSON.stringify({ expected_configuration_version: configuration.row_version }),
+    });
+  },
+  openingStockAuthority(
+    session: Session,
+    projectId: string,
+    postingDate: string,
+  ): Promise<OpeningStockAuthority> {
+    return request(
+      session,
+      `/projects/${projectId}/inventory/opening-stock-authority?posting_date=${postingDate}`,
+    );
+  },
+  listInventoryPostings(session: Session, projectId: string): Promise<InventoryPosting[]> {
+    return request(session, `/projects/${projectId}/inventory-postings`);
+  },
+  postOpeningStock(
+    session: Session,
+    projectId: string,
+    postingDate: string,
+    lines: Array<{ product_definition_id: string; entered_quantity: string; entered_unit_code: string }>,
+    idempotencyKey: string,
+  ): Promise<InventoryPosting> {
+    return request(session, `/projects/${projectId}/inventory-postings/opening-stock`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ posting_date: postingDate, lines }),
+    });
+  },
+  reverseInventoryPosting(
+    session: Session,
+    projectId: string,
+    postingId: string,
+    postingDate: string,
+    reason: string,
+    idempotencyKey: string,
+  ): Promise<InventoryPosting> {
+    return request(session, `/projects/${projectId}/inventory-postings/${postingId}/reversals`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ posting_date: postingDate, reason }),
     });
   },
   getReport(session: Session, reportId: string): Promise<Report> {

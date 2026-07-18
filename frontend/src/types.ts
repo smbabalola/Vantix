@@ -130,3 +130,53 @@ export interface ProjectProduct {
   prices: ProductPrice[];
 }
 
+export interface OpeningStockAuthorityProduct {
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  item_code: string;
+  item_name: string;
+  package_size: string;
+  package_unit_code: PackageContentUnitCode;
+  inventory_unit_code: ProductUnitCode;
+  price: ProductPrice | null;
+}
+
+export interface OpeningStockAuthority {
+  project_id: string;
+  posting_date: string;
+  configuration_snapshot_id: string;
+  products: OpeningStockAuthorityProduct[];
+}
+
+export interface InventoryLedgerLine {
+  id: string;
+  product_definition_id: string;
+  configuration_product_version_id: string;
+  product_price_version_id: string | null;
+  entered_quantity: string;
+  entered_unit_code: ProductUnitCode;
+  canonical_signed_quantity: string;
+  canonical_unit_code: "kg" | "L" | "each";
+  price_status: "ready" | "unavailable";
+  applied_unit_price: string | null;
+  price_basis_unit_code: ProductUnitCode | null;
+  currency: string | null;
+  posted_line_amount: string | null;
+  frozen_product: Record<string, unknown>;
+}
+
+export interface InventoryPosting {
+  id: string;
+  project_id: string;
+  source_configuration_snapshot_id: string;
+  posting_type: "opening_stock" | "reversal";
+  status: "posted";
+  posting_date: string;
+  reversal_of_posting_id: string | null;
+  reversal_posting_id: string | null;
+  reason: string | null;
+  posted_by: string;
+  posted_at: string;
+  lines: InventoryLedgerLine[];
+}
+
