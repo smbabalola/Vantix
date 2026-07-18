@@ -24,11 +24,24 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   const [message, setMessage] = useState("Loading configuration…");
   const [dirty, setDirty] = useState(false);
   const [pending, setPending] = useState<"create" | "save" | "validate" | "activate">();
+  const pendingRef = useRef(false);
   const createKey = useRef(crypto.randomUUID());
   const activationKey = useRef(crypto.randomUUID());
   const mutable = configuration?.state === "draft";
   const busy = pending !== undefined;
   const projectDepthUnit: "m" | "ft" = project?.unit_set === "Field" ? "ft" : "m";
+
+  function beginPending(operation: "create" | "save" | "validate" | "activate") {
+    if (pendingRef.current) return false;
+    pendingRef.current = true;
+    setPending(operation);
+    return true;
+  }
+
+  function endPending() {
+    pendingRef.current = false;
+    setPending(undefined);
+  }
 
   useEffect(() => {
     Promise.all([api.getProject(session, projectId), api.listConfigurations(session, projectId)])
@@ -42,7 +55,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   }, [projectId, session]);
 
   function updateInterval(id: string, patch: Partial<BasicInterval>) {
-    if (!configuration) return;
+    if (!configuration || !mutable || pendingRef.current) return;
     setConfiguration({
       ...configuration,
       data: {
@@ -58,6 +71,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   }
 
   function updateConfiguration(next: Configuration) {
+    if (!mutable || pendingRef.current) return;
     setConfiguration(next);
     setReadiness(undefined);
     setDirty(true);
@@ -65,8 +79,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   }
 
   async function createDraft() {
-    if (busy) return;
-    setPending("create");
+    if (!beginPending("create")) return;
     setMessage("Creating draft…");
     try {
       setConfiguration(await api.createConfiguration(session, projectId, createKey.current));
@@ -78,13 +91,12 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unable to create draft.");
     } finally {
-      setPending(undefined);
+      endPending();
     }
   }
 
   async function save() {
-    if (!configuration || !dirty || busy) return;
-    setPending("save");
+    if (!configuration || !dirty || !beginPending("save")) return;
     setMessage("Saving…");
     try {
       const saved = await api.saveConfiguration(session, configuration);
@@ -99,13 +111,12 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
           : error instanceof Error ? error.message : "Save failed",
       );
     } finally {
-      setPending(undefined);
+      endPending();
     }
   }
 
   async function validate() {
-    if (!configuration || dirty || busy) return;
-    setPending("validate");
+    if (!configuration || dirty || !beginPending("validate")) return;
     setMessage("Validating…");
     try {
       setReadiness(await api.validateConfiguration(session, configuration));
@@ -114,13 +125,12 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
       setReadiness(undefined);
       setMessage(error instanceof Error ? error.message : "Validation failed");
     } finally {
-      setPending(undefined);
+      endPending();
     }
   }
 
   async function activate() {
-    if (!configuration || !readiness || dirty || busy) return;
-    setPending("activate");
+    if (!configuration || !readiness || dirty || !beginPending("activate")) return;
     setMessage("Activating…");
     try {
       const next = await api.activateConfiguration(
@@ -139,12 +149,12 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
       }
       setMessage(error instanceof Error ? error.message : "Activation failed");
     } finally {
-      setPending(undefined);
+      endPending();
     }
   }
 
   function removeInterval(id: string) {
-    if (!configuration) return;
+    if (!configuration || !mutable || pendingRef.current) return;
     const intervals = configuration.data.intervals.filter((item) => item.id !== id);
     updateConfiguration({
       ...configuration,
@@ -194,7 +204,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
               <div className="panel-heading"><div><span className="eyebrow">Version {configuration.version}</span><h2>Basic drilling intervals</h2></div><span className={`state-badge state-${mutable ? "draft" : "locked"}`}>{mutable ? "editable" : "immutable"}</span></div>
               <p className="muted">Only confirmed foundation fields are recorded. Leave measured depths blank when unavailable; Vantix will not infer them.</p>
               {configuration.data.intervals.map((interval) => (
-                <fieldset className="interval-card" key={interval.id} disabled={!mutable}>
+                <fieldset className="interval-card" key={interval.id} disabled={!mutable || busy}>
                   <legend>{interval.name || "New interval"}</legend>
                   <div className="form-grid">
                     <label>Interval name<input value={interval.name} onChange={(event) => updateInterval(interval.id, { name: event.target.value })} /></label>

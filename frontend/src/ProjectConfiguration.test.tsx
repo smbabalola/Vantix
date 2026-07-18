@@ -156,4 +156,68 @@ describe("project configuration workspace", () => {
     const secondHeaders = activationCalls[1][1]?.headers as Record<string, string>;
     expect(secondHeaders["Idempotency-Key"]).toBe(firstHeaders["Idempotency-Key"]);
   });
+
+  it("keeps interval controls disabled until a deferred save settles", async () => {
+    const project = {
+      id: "00000000-0000-4000-8000-000000000030",
+      organisation_id: session.organisationId,
+      project_code: "NS-C",
+      project_name: "North Sea C",
+      well_name: "C-01",
+      time_zone: "Europe/London",
+      currency: "GBP",
+      unit_set: "Metric",
+      status: "draft",
+      current_configuration_version_id: null,
+      active_configuration_snapshot_id: null,
+    };
+    const configuration = {
+      id: "00000000-0000-4000-8000-000000000031",
+      project_id: project.id,
+      version: 1,
+      state: "draft",
+      row_version: 1,
+      data: {
+        default_interval_id: "00000000-0000-4000-8000-000000000032",
+        intervals: [{
+          id: "00000000-0000-4000-8000-000000000032",
+          name: "Original interval",
+          operation_mode: "drilling",
+        }],
+      },
+      change_summary: null,
+      snapshot_id: null,
+      checksum: null,
+    };
+    let completeSave: (value: Response) => void = () => undefined;
+    const deferredSave = new Promise<Response>((resolve) => {
+      completeSave = resolve;
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => response(project))
+      .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => deferredSave);
+
+    render(<ProjectConfiguration projectId={project.id} session={session} />);
+    const intervalName = await screen.findByLabelText("Interval name");
+    fireEvent.change(intervalName, { target: { value: "Saved interval" } });
+    fireEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    await waitFor(() => expect(intervalName).toBeDisabled());
+    expect(screen.getByRole("combobox", { name: "Operation mode" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /remove interval/i })).toBeDisabled();
+
+    completeSave(new Response(JSON.stringify({
+      ...configuration,
+      row_version: 2,
+      data: {
+        ...configuration.data,
+        intervals: [{ ...configuration.data.intervals[0], name: "Saved interval" }],
+      },
+    }), { status: 200 }));
+
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    await waitFor(() => expect(intervalName).toBeEnabled());
+    expect(intervalName).toHaveValue("Saved interval");
+  });
 });

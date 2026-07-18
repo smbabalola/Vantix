@@ -1,8 +1,12 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
+from vantix_core.canonical import payload_checksum
 from vantix_core.project_configuration import (
+    ConfigurationActivationError,
     build_project_snapshot,
+    guard_configuration_activation,
     validate_project_configuration,
 )
 
@@ -119,3 +123,33 @@ def test_vtx_prj_003_snapshot_canonicalises_depth_decimals() -> None:
         "unit": "m",
         "provenance": "entered",
     }
+
+
+def test_vtx_prj_003_activation_guard_rejects_stale_and_regressive_versions() -> None:
+    data = configuration()
+    common = {
+        "project": project_identity(),
+        "data": data,
+        "state": "draft",
+        "row_version": 1,
+        "expected_version": 1,
+        "expected_checksum": payload_checksum(data),
+    }
+
+    with pytest.raises(ConfigurationActivationError, match="latest") as not_latest:
+        guard_configuration_activation(
+            **common,
+            version_number=1,
+            latest_version_number=2,
+            active_version_number=2,
+        )
+    assert not_latest.value.code == "CONFIGURATION_NOT_LATEST"
+
+    with pytest.raises(ConfigurationActivationError, match="older") as regression:
+        guard_configuration_activation(
+            **common,
+            version_number=2,
+            latest_version_number=2,
+            active_version_number=2,
+        )
+    assert regression.value.code == "CONFIGURATION_VERSION_REGRESSION"

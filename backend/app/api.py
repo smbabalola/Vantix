@@ -8,12 +8,15 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from vantix_core.canonical import payload_checksum
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
     DailyReport,
     LifecycleError,
     ReportRevision,
+)
+from vantix_core.project_configuration import (
+    ConfigurationActivationError,
+    guard_configuration_activation,
 )
 
 from .auth import AuthContext, Capability, auth_context
@@ -256,7 +259,13 @@ def create_configuration(
             )
         version = len(project.configuration_versions) + 1
         data = body.data.model_dump(mode="json", exclude_none=True) if body.data else {}
-        record = {"id": uuid4(), "version": version, "state": "draft", "data": data}
+        record = {
+            "id": uuid4(),
+            "version": version,
+            "state": "draft",
+            "row_version": 1,
+            "data": data,
+        }
         project.configuration_versions.append(record)
         return ConfigurationView(
             id=cast(UUID, record["id"]),
@@ -364,27 +373,54 @@ def activate_configuration(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "CONFIGURATION_NOT_FOUND"})
 
     def activate() -> ConfigurationView:
-        if (
-            cast(int, record.get("row_version", 1)) != body.expected_version
-            or payload_checksum(cast(dict[str, Any], record["data"])) != body.expected_checksum
-        ):
-            raise HTTPException(
-                status.HTTP_412_PRECONDITION_FAILED,
-                detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        try:
+            guard_configuration_activation(
+                project={
+                    "project_code": project.project_code,
+                    "project_name": project.project_name,
+                    "well_name": project.well_name,
+                    "time_zone": project.time_zone,
+                    "currency": project.currency,
+                    "unit_set": project.unit_set,
+                },
+                data=cast(dict[str, Any], record["data"]),
+                state=cast(str, record["state"]),
+                row_version=cast(int, record["row_version"]),
+                expected_version=body.expected_version,
+                expected_checksum=body.expected_checksum,
+                version_number=cast(int, record["version"]),
+                latest_version_number=max(
+                    cast(int, item["version"]) for item in project.configuration_versions
+                ),
+                active_version_number=(
+                    project.active_snapshot.version if project.active_snapshot else None
+                ),
             )
+        except ConfigurationActivationError as exc:
+            status_codes = {
+                "CONFIGURATION_VERSION_CONFLICT": status.HTTP_412_PRECONDITION_FAILED,
+                "CONFIGURATION_NOT_READY": status.HTTP_422_UNPROCESSABLE_ENTITY,
+            }
+            raise HTTPException(
+                status_codes.get(exc.code, status.HTTP_409_CONFLICT),
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         snapshot = ConfigurationSnapshot.create(
             project.id,
             cast(int, record["version"]),
             cast(dict[str, Any], record["data"]),
         )
-        project.active_snapshot = snapshot
+        for item in project.configuration_versions:
+            if item["state"] == "active":
+                item["state"] = "superseded"
         record["state"] = "active"
+        project.active_snapshot = snapshot
         return ConfigurationView(
             id=cast(UUID, record["id"]),
             project_id=project.id,
             version=cast(int, record["version"]),
             state=cast(Any, record["state"]),
-            row_version=1,
+            row_version=cast(int, record["row_version"]),
             data=cast(dict[str, Any], record["data"]),
             snapshot_id=snapshot.id,
             checksum=snapshot.checksum,

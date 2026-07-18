@@ -28,6 +28,14 @@ class ConfigurationReadiness:
     issues: tuple[ConfigurationIssue, ...]
 
 
+class ConfigurationActivationError(ValueError):
+    """A repository-independent project-configuration transition failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 PROJECT_REQUIRED_FIELDS = (
     "project_code",
     "project_name",
@@ -249,6 +257,47 @@ def validate_project_configuration(
         can_activate=not issues,
         issues=tuple(issues),
     )
+
+
+def guard_configuration_activation(
+    *,
+    project: Mapping[str, Any],
+    data: Mapping[str, Any],
+    state: str,
+    row_version: int,
+    expected_version: int,
+    expected_checksum: str,
+    version_number: int,
+    latest_version_number: int,
+    active_version_number: int | None,
+) -> ConfigurationReadiness:
+    """Enforce activation invariants consistently across persistence adapters."""
+
+    if state != "draft":
+        raise ConfigurationActivationError(
+            "CONFIGURATION_NOT_DRAFT", "Only a draft configuration can be activated."
+        )
+    if row_version != expected_version or payload_checksum(data) != expected_checksum:
+        raise ConfigurationActivationError(
+            "CONFIGURATION_VERSION_CONFLICT",
+            "Configuration changed after it was reviewed.",
+        )
+    if version_number != latest_version_number:
+        raise ConfigurationActivationError(
+            "CONFIGURATION_NOT_LATEST", "Only the latest configuration can be activated."
+        )
+    if active_version_number is not None and version_number <= active_version_number:
+        raise ConfigurationActivationError(
+            "CONFIGURATION_VERSION_REGRESSION",
+            "An older configuration cannot replace the active configuration.",
+        )
+    readiness = validate_project_configuration(project, data)
+    if not readiness.can_activate:
+        raise ConfigurationActivationError(
+            "CONFIGURATION_NOT_READY",
+            "Resolve configuration readiness issues before activation.",
+        )
+    return readiness
 
 
 def build_project_snapshot(

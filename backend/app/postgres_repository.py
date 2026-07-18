@@ -17,7 +17,9 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
 from vantix_core.project_configuration import (
+    ConfigurationActivationError,
     build_project_snapshot,
+    guard_configuration_activation,
     validate_project_configuration,
 )
 from vantix_core.readiness import validate_foundation_readiness
@@ -645,40 +647,43 @@ class PostgresFoundationRepository:
             )
             if configuration is None:
                 raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
-            if configuration.state != "draft":
-                raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_NOT_DRAFT")
-            if (
-                configuration.row_version != expected_version
-                or payload_checksum(configuration.data) != expected_checksum
-            ):
-                raise _error(
-                    status.HTTP_412_PRECONDITION_FAILED,
-                    "CONFIGURATION_VERSION_CONFLICT",
-                    "Configuration changed after it was reviewed.",
-                )
             latest = session.scalar(
                 select(ConfigurationVersion)
                 .where(ConfigurationVersion.project_id == project_id)
                 .order_by(ConfigurationVersion.version_number.desc())
                 .limit(1)
             )
-            if latest is None or latest.id != configuration.id:
-                raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_NOT_LATEST")
-            if project.current_configuration_version_id:
-                current = session.get(
-                    ConfigurationVersion, project.current_configuration_version_id
-                )
-                if current is not None and configuration.version_number <= current.version_number:
-                    raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_VERSION_REGRESSION")
-            readiness = validate_project_configuration(
-                self._project_configuration_data(project), configuration.data
+            current = (
+                session.get(ConfigurationVersion, project.current_configuration_version_id)
+                if project.current_configuration_version_id
+                else None
             )
-            if not readiness.can_activate:
-                raise _error(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "CONFIGURATION_NOT_READY",
-                    "Resolve configuration readiness issues before activation.",
+            try:
+                guard_configuration_activation(
+                    project=self._project_configuration_data(project),
+                    data=configuration.data,
+                    state=configuration.state,
+                    row_version=configuration.row_version,
+                    expected_version=expected_version,
+                    expected_checksum=expected_checksum,
+                    version_number=configuration.version_number,
+                    latest_version_number=(
+                        latest.version_number
+                        if latest is not None
+                        else configuration.version_number
+                    ),
+                    active_version_number=(current.version_number if current is not None else None),
                 )
+            except ConfigurationActivationError as exc:
+                status_codes = {
+                    "CONFIGURATION_VERSION_CONFLICT": status.HTTP_412_PRECONDITION_FAILED,
+                    "CONFIGURATION_NOT_READY": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                }
+                raise _error(
+                    status_codes.get(exc.code, status.HTTP_409_CONFLICT),
+                    exc.code,
+                    str(exc),
+                ) from exc
             activated_at = datetime.now(UTC)
             snapshot_id = uuid4()
             snapshot_json, checksum = build_project_snapshot(
