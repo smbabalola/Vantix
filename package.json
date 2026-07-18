@@ -1,0 +1,12 @@
+{
+  "name": "vantix-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test": "python -m pytest && npm --prefix frontend test",
+    "build": "npm --prefix frontend run build",
+    "lint": "python -m ruff check backend && python -m mypy backend/app backend/vantix_core && npm --prefix frontend run lint",
+    "docs:validate": "python scripts/validate_documentation.py"
+  }
+}
+
