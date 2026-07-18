@@ -2,7 +2,6 @@ from uuid import UUID, uuid4
 
 from app.store import FoundationStore
 from fastapi.testclient import TestClient
-from vantix_core.canonical import payload_checksum
 
 
 def headers(user_id=None, organisation_id=None, capabilities="") -> dict[str, str]:
@@ -51,12 +50,43 @@ def setup_report(client: TestClient):
             }
         },
     ).json()
+    product = client.post(
+        f"/api/v1/projects/{project['id']}/products",
+        headers=editor_headers,
+        json={
+            "configuration_version_id": configuration["id"],
+            "expected_configuration_version": configuration["row_version"],
+            "item_code": "BAR-001",
+            "item_name": "Barite",
+            "packaging": "sack",
+            "package_size": "25",
+            "package_unit_code": "kg",
+            "inventory_applicable": True,
+            "inventory_unit_code": "package",
+            "specific_gravity": "4.2",
+        },
+    ).json()
+    client.post(
+        f"/api/v1/project-products/{product['id']}/prices",
+        headers=editor_headers,
+        json={
+            "expected_configuration_version": product["configuration_row_version"],
+            "effective_from": "2026-01-01",
+            "unit_price": "18.50",
+            "currency": "GBP",
+            "price_basis_unit_code": "package",
+        },
+    )
+    readiness = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/validate",
+        headers=editor_headers,
+    ).json()
     client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/activate",
         headers={**editor_headers, "Idempotency-Key": "activate-config-1"},
         json={
-            "expected_version": configuration["row_version"],
-            "expected_checksum": payload_checksum(configuration["data"]),
+            "expected_version": readiness["validated_version"],
+            "expected_checksum": readiness["draft_checksum"],
         },
     )
     report = client.post(
@@ -190,13 +220,18 @@ def test_vtx_prj_003_in_memory_activation_matches_hardened_lifecycle(
         headers={**request_headers, "Idempotency-Key": "create-incomplete"},
         json={"data": {}},
     ).json()
+    incomplete_readiness = client.post(
+        f"/api/v1/projects/{incomplete_project['id']}/configuration-versions/"
+        f"{incomplete['id']}/validate",
+        headers=request_headers,
+    ).json()
     incomplete_activation = client.post(
         f"/api/v1/projects/{incomplete_project['id']}/configuration-versions/"
         f"{incomplete['id']}/activate",
         headers={**request_headers, "Idempotency-Key": "activate-incomplete"},
         json={
-            "expected_version": incomplete["row_version"],
-            "expected_checksum": payload_checksum(incomplete["data"]),
+            "expected_version": incomplete_readiness["validated_version"],
+            "expected_checksum": incomplete_readiness["draft_checksum"],
         },
     )
     assert incomplete_activation.status_code == 422
@@ -224,15 +259,48 @@ def test_vtx_prj_003_in_memory_activation_matches_hardened_lifecycle(
             },
         )
         assert response.status_code == 201
-        return response.json()
+        configuration = response.json()
+        product = client.post(
+            f"/api/v1/projects/{project_id}/products",
+            headers=request_headers,
+            json={
+                "configuration_version_id": configuration["id"],
+                "expected_configuration_version": configuration["row_version"],
+                "item_code": "BAR-001",
+                "item_name": "Barite",
+                "packaging": "sack",
+                "package_size": "25",
+                "package_unit_code": "kg",
+                "inventory_applicable": True,
+                "inventory_unit_code": "package",
+                "specific_gravity": "4.2",
+            },
+        ).json()
+        price = client.post(
+            f"/api/v1/project-products/{product['id']}/prices",
+            headers=request_headers,
+            json={
+                "expected_configuration_version": product["configuration_row_version"],
+                "effective_from": "2026-01-01",
+                "unit_price": "18.50",
+                "currency": "GBP",
+                "price_basis_unit_code": "package",
+            },
+        )
+        assert price.status_code == 201
+        return configuration
 
     def activate(configuration: dict, key: str):
+        readiness = client.post(
+            f"/api/v1/projects/{project_id}/configuration-versions/{configuration['id']}/validate",
+            headers=request_headers,
+        ).json()
         return client.post(
             f"/api/v1/projects/{project_id}/configuration-versions/{configuration['id']}/activate",
             headers={**request_headers, "Idempotency-Key": key},
             json={
-                "expected_version": configuration["row_version"],
-                "expected_checksum": payload_checksum(configuration["data"]),
+                "expected_version": readiness["validated_version"],
+                "expected_checksum": readiness["draft_checksum"],
             },
         )
 
@@ -254,3 +322,150 @@ def test_vtx_prj_003_in_memory_activation_matches_hardened_lifecycle(
     assert sum(record["state"] == "active" for record in records) == 1
     assert project_record.active_snapshot is not None
     assert project_record.active_snapshot.version == 2
+
+
+def test_vtx_pro_001_002_003_products_prices_readiness_and_snapshot_contract(
+    client: TestClient, foundation_store: FoundationStore
+) -> None:
+    org_id = uuid4()
+    request_headers = headers(uuid4(), org_id, "create_project,configure_project")
+    project = client.post(
+        f"/api/v1/organisations/{org_id}/projects",
+        headers=request_headers,
+        json={
+            "project_code": "PRO",
+            "project_name": "Product Project",
+            "well_name": "Well PRO",
+            "time_zone": "Europe/London",
+            "currency": "GBP",
+            "unit_set": "Metric",
+        },
+    ).json()
+    interval_id = str(uuid4())
+    configuration = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions",
+        headers={**request_headers, "Idempotency-Key": "product-configuration"},
+        json={
+            "data": {
+                "default_interval_id": interval_id,
+                "intervals": [
+                    {
+                        "id": interval_id,
+                        "name": "Product interval",
+                        "operation_mode": "drilling",
+                    }
+                ],
+            }
+        },
+    ).json()
+    product_request = {
+        "configuration_version_id": configuration["id"],
+        "expected_configuration_version": 1,
+        "item_code": "BAR-001",
+        "item_name": "Barite",
+        "packaging": "sack",
+        "package_size": "025.000",
+        "package_unit_code": "kg",
+        "inventory_applicable": True,
+        "inventory_unit_code": "package",
+        "specific_gravity": "04.2000",
+    }
+    product = client.post(
+        f"/api/v1/projects/{project['id']}/products",
+        headers=request_headers,
+        json=product_request,
+    )
+    assert product.status_code == 201
+    product_body = product.json()
+    assert product_body["package_size"] == "25"
+    assert product_body["specific_gravity"] == "4.2"
+
+    stale = client.post(
+        f"/api/v1/projects/{project['id']}/products",
+        headers=request_headers,
+        json={**product_request, "item_code": "STALE"},
+    )
+    assert stale.status_code == 412
+
+    first_price = client.post(
+        f"/api/v1/project-products/{product_body['id']}/prices",
+        headers=request_headers,
+        json={
+            "expected_configuration_version": 2,
+            "effective_from": "2026-01-01",
+            "effective_to": "2026-07-01",
+            "unit_price": "18.5000",
+            "currency": "GBP",
+            "price_basis_unit_code": "package",
+        },
+    )
+    assert first_price.status_code == 201
+    assert first_price.json()["configuration_row_version"] == 3
+
+    overlap = client.post(
+        f"/api/v1/project-products/{product_body['id']}/prices",
+        headers=request_headers,
+        json={
+            "expected_configuration_version": 3,
+            "effective_from": "2026-06-30",
+            "unit_price": "19",
+            "currency": "GBP",
+            "price_basis_unit_code": "package",
+        },
+    )
+    assert overlap.status_code == 422
+    assert overlap.json()["detail"]["code"] == "PRICE_PERIOD_OVERLAP"
+
+    second_price = client.post(
+        f"/api/v1/project-products/{product_body['id']}/prices",
+        headers=request_headers,
+        json={
+            "expected_configuration_version": 3,
+            "effective_from": "2026-07-01",
+            "unit_price": "19.25",
+            "currency": "GBP",
+            "price_basis_unit_code": "package",
+        },
+    )
+    assert second_price.status_code == 201
+    selected = client.get(
+        f"/api/v1/project-products/{product_body['id']}/price-at?date=2026-07-01",
+        headers=request_headers,
+    )
+    assert selected.status_code == 200
+    assert selected.json()["unit_price"] == "19.25"
+
+    readiness = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/validate",
+        headers=request_headers,
+    ).json()
+    assert readiness["can_activate"] is True
+    activated = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/activate",
+        headers={**request_headers, "Idempotency-Key": "activate-products"},
+        json={
+            "expected_version": readiness["validated_version"],
+            "expected_checksum": readiness["draft_checksum"],
+        },
+    )
+    assert activated.status_code == 200
+    snapshot = foundation_store.projects[UUID(project["id"])].active_snapshot
+    assert snapshot is not None
+    assert snapshot.payload["products"][0]["prices"][1]["unit_price"] == "19.25"
+    assert (
+        snapshot.payload["products"][0]["product_definition_id"]
+        == product_body["product_definition_id"]
+    )
+
+    revised = client.post(
+        f"/api/v1/projects/{project['id']}/configuration-versions",
+        headers={**request_headers, "Idempotency-Key": "copy-product-configuration"},
+        json={"copy_active": True},
+    ).json()
+    copied = client.get(
+        f"/api/v1/projects/{project['id']}/products",
+        params={"configuration_version_id": revised["id"]},
+        headers=request_headers,
+    ).json()[0]
+    assert copied["id"] != product_body["id"]
+    assert copied["product_definition_id"] == product_body["product_definition_id"]

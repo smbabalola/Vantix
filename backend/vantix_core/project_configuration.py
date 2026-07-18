@@ -11,6 +11,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from .canonical import payload_checksum
+from .products import ProductValidationError, canonicalise_products
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +253,21 @@ def validate_project_configuration(
             )
         )
 
+    raw_products = data.get("products")
+    if not isinstance(raw_products, list):
+        issues.append(
+            ConfigurationIssue(
+                "ACTIVE_PRODUCT_REQUIRED",
+                "products",
+                "At least one active product with an effective price is required.",
+            )
+        )
+    else:
+        try:
+            canonicalise_products(raw_products, str(project.get("currency", "")))
+        except ProductValidationError as exc:
+            issues.append(ConfigurationIssue(exc.code, exc.field, str(exc)))
+
     return ConfigurationReadiness(
         state="ready" if not issues else "incomplete",
         can_activate=not issues,
@@ -317,6 +333,7 @@ def build_project_snapshot(
     if not readiness.can_activate:
         raise ValueError("Project configuration is not ready for activation.")
     intervals = deepcopy(data["intervals"])
+    products = canonicalise_products(data["products"], str(project["currency"]))
     canonical_unit = UNIT_SET_LENGTH_UNITS[str(project["unit_set"])]
     for interval in intervals:
         for field in ("top_md", "bottom_md"):
@@ -325,7 +342,7 @@ def build_project_snapshot(
                 interval[field]["unit"] = canonical_unit
 
     snapshot = {
-        "schema_version": "1.0",
+        "schema_version": "1.2",
         "organisation_id": str(organisation_id),
         "project": {
             "id": str(project_id),
@@ -349,5 +366,6 @@ def build_project_snapshot(
         },
         "default_interval_id": str(data["default_interval_id"]),
         "intervals": intervals,
+        "products": products,
     }
     return snapshot, payload_checksum(snapshot)

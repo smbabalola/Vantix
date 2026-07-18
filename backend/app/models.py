@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -130,6 +133,114 @@ class ConfigurationVersion(TenantMixin, Base):
             unique=True,
             postgresql_where=state == "draft",
         ),
+    )
+
+
+class ProductDefinition(TenantMixin, Base):
+    __tablename__ = "project_product_definitions"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ProjectProduct(TenantMixin, Base):
+    __tablename__ = "project_products"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    configuration_version_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_configuration_versions.id"), nullable=False
+    )
+    product_definition_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_product_definitions.id"), nullable=False
+    )
+    item_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    item_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    alternate_name: Mapped[str | None] = mapped_column(String(200))
+    packaging: Mapped[str] = mapped_column(String(30), nullable=False)
+    package_size: Mapped[Decimal] = mapped_column(Numeric(24, 12), nullable=False)
+    package_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    inventory_applicable: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    inventory_unit_code: Mapped[str | None] = mapped_column(String(20))
+    specific_gravity: Mapped[Decimal | None] = mapped_column(Numeric(18, 12))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    __table_args__ = (
+        Index(
+            "uq_project_products_configuration_code",
+            "configuration_version_id",
+            func.lower(item_code),
+            unique=True,
+        ),
+        UniqueConstraint(
+            "configuration_version_id",
+            "product_definition_id",
+            name="uq_project_products_configuration_definition",
+        ),
+        CheckConstraint("package_size > 0", name="ck_project_products_package_size"),
+        CheckConstraint(
+            "specific_gravity IS NULL OR specific_gravity > 0",
+            name="ck_project_products_specific_gravity",
+        ),
+        CheckConstraint(
+            "(inventory_applicable AND inventory_unit_code IS NOT NULL) OR "
+            "(NOT inventory_applicable AND inventory_unit_code IS NULL)",
+            name="ck_project_products_inventory_applicability",
+        ),
+        CheckConstraint(
+            "packaging IN ('sack','pail','drum','tote','bulk','case','each','other')",
+            name="ck_project_products_packaging",
+        ),
+        CheckConstraint(
+            "package_unit_code IN ('kg','t','lb','L','m3','gal_us','bbl','each')",
+            name="ck_project_products_package_unit",
+        ),
+        CheckConstraint(
+            "inventory_unit_code IS NULL OR inventory_unit_code IN "
+            "('kg','t','lb','L','m3','gal_us','bbl','each','package')",
+            name="ck_project_products_inventory_unit",
+        ),
+        CheckConstraint(
+            "inventory_unit_code IS NULL OR inventory_unit_code = 'package' OR "
+            "(inventory_unit_code IN ('kg','t','lb') AND package_unit_code IN ('kg','t','lb')) OR "
+            "(inventory_unit_code IN ('L','m3','gal_us','bbl') AND "
+            " package_unit_code IN ('L','m3','gal_us','bbl')) OR "
+            "(inventory_unit_code = 'each' AND package_unit_code = 'each')",
+            name="ck_project_products_unit_dimension",
+        ),
+    )
+
+
+class ProductPrice(TenantMixin, Base):
+    __tablename__ = "product_price_history"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    project_product_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("project_products.id", ondelete="CASCADE"), nullable=False
+    )
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(24, 12), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    price_basis_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str | None] = mapped_column(String(200))
+    __table_args__ = (
+        CheckConstraint("unit_price >= 0", name="ck_product_prices_amount"),
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to > effective_from",
+            name="ck_product_prices_range",
+        ),
+        CheckConstraint(
+            "price_basis_unit_code IN ('kg','t','lb','L','m3','gal_us','bbl','each','package')",
+            name="ck_product_prices_basis_unit",
+        ),
+        Index("ix_product_prices_product_start", "project_product_id", "effective_from"),
     )
 
 

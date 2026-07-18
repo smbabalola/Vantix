@@ -96,3 +96,37 @@ export interface ConfigurationReadiness {
   issues: Array<{ code: string; field: string; message: string; severity: string }>;
 }
 
+export type ProductUnitCode = "kg" | "t" | "lb" | "L" | "m3" | "gal_us" | "bbl" | "each" | "package";
+export type PackageContentUnitCode = Exclude<ProductUnitCode, "package">;
+export type PackagingType = "sack" | "pail" | "drum" | "tote" | "bulk" | "case" | "each" | "other";
+
+export interface ProductPrice {
+  id: string;
+  project_product_id: string;
+  effective_from: string;
+  effective_to: string | null;
+  unit_price: string;
+  currency: string;
+  price_basis_unit_code: ProductUnitCode;
+  source: string | null;
+}
+
+export interface ProjectProduct {
+  id: string;
+  product_definition_id: string;
+  project_id: string;
+  configuration_version_id: string;
+  configuration_row_version: number;
+  item_code: string;
+  item_name: string;
+  alternate_name: string | null;
+  packaging: PackagingType;
+  package_size: string;
+  package_unit_code: PackageContentUnitCode;
+  inventory_applicable: boolean;
+  inventory_unit_code: ProductUnitCode | null;
+  specific_gravity: string | null;
+  active: boolean;
+  prices: ProductPrice[];
+}
+

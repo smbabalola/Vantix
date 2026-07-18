@@ -28,6 +28,17 @@ The project-configuration snapshot slice adds:
 - immutable configuration-snapshot binding on every new report revision
 - a responsive configuration workspace with honest unavailable-value states
 
+The project-products/pricing slice adds:
+
+- stable project product lineage with configuration-version-owned product authority
+- explicit packaging and inventory units, including package-content-compatible pricing
+- optional specific gravity with unavailable state preserved
+- effective-dated project-currency prices using non-overlapping half-open periods
+- optimistic concurrency, audit, RLS, and database immutability for product authority
+- configuration readiness/checksum and immutable snapshot inclusion
+- a responsive product/pricing grid with deliberate effective dates, field errors, and unsaved-work gating
+- no inventory posting or balance behaviour
+
 PostgreSQL is the default runtime repository. The in-memory adapter remains only as an explicit
 test dependency override. Submission readiness, version checking, state transition, frozen
 payload, checksum, idempotency record, and audit events are committed in one database transaction.
@@ -78,5 +89,5 @@ be `NOSUPERUSER NOBYPASSRLS` and have normal schema, table, sequence, and functi
   object-storage upload and authorised download-link delivery are not implemented.
 - Draft caching is local-only; background synchronisation and broader offline operation remain out
   of MVP scope.
-- Products, inventory, pits/volumes, and fluid checks remain deliberately deferred to subsequent
-  vertical slices.
+- Project products and effective-price configuration are implemented. Inventory postings, opening
+  stock, movements, balances, reconciliation, pits/volumes, and fluid checks remain deferred.

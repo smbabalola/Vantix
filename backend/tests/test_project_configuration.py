@@ -24,6 +24,7 @@ def project_identity() -> dict[str, str]:
 
 def configuration() -> dict:
     interval_id = str(uuid4())
+    product_id = str(uuid4())
     return {
         "default_interval_id": interval_id,
         "intervals": [
@@ -33,6 +34,31 @@ def configuration() -> dict:
                 "operation_mode": "drilling",
                 "top_md": {"value": "1000", "unit": "m", "provenance": "entered"},
                 "bottom_md": {"value": "1800", "unit": "m", "provenance": "entered"},
+            }
+        ],
+        "products": [
+            {
+                "id": product_id,
+                "product_definition_id": str(uuid4()),
+                "item_code": "BAR-001",
+                "item_name": "Barite",
+                "packaging": "sack",
+                "package_size": "25",
+                "package_unit_code": "kg",
+                "inventory_applicable": True,
+                "inventory_unit_code": "package",
+                "specific_gravity": "4.2",
+                "active": True,
+                "prices": [
+                    {
+                        "id": str(uuid4()),
+                        "effective_from": "2026-01-01",
+                        "effective_to": None,
+                        "unit_price": "18.50",
+                        "currency": "GBP",
+                        "price_basis_unit_code": "package",
+                    }
+                ],
             }
         ],
     }

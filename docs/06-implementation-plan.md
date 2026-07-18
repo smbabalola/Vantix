@@ -74,6 +74,8 @@ Acceptance: VTX-DAY-001 to VTX-DAY-010; VTX-COM-001 to VTX-COM-004; VTX-OFF-001 
 
 ## Phase 6 — Products, prices, transfers, and inventory
 
+- product setup and effective price authority are delivered first as a configuration-only vertical slice
+- transfer, inventory, opening-stock, and cost work starts only after that authority is stable
 - product setup
 - effective price history
 - draft transfer tickets

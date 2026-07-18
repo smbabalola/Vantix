@@ -3,6 +3,8 @@ import type {
   GeneralSection,
   Project,
   ProjectConfiguration,
+  ProjectProduct,
+  ProductPrice,
   Readiness,
   Report,
 } from "./types";
@@ -18,6 +20,7 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
+    public readonly field?: string,
   ) {
     super(message);
   }
@@ -37,8 +40,14 @@ async function request<T>(session: Session, path: string, init: RequestInit = {}
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     const detail = body.detail ?? body;
-    throw new ApiError(response.status, detail.code ?? "REQUEST_FAILED", detail.message ?? "Request failed");
+    throw new ApiError(
+      response.status,
+      detail.code ?? "REQUEST_FAILED",
+      detail.message ?? "Request failed",
+      detail.field,
+    );
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -105,6 +114,77 @@ export const api = {
         }),
       },
     );
+  },
+  listProducts(
+    session: Session,
+    projectId: string,
+    configurationVersionId: string,
+  ): Promise<ProjectProduct[]> {
+    return request(
+      session,
+      `/projects/${projectId}/products?configuration_version_id=${configurationVersionId}`,
+    );
+  },
+  createProduct(
+    session: Session,
+    configuration: ProjectConfiguration,
+    values: Omit<ProjectProduct, "id" | "product_definition_id" | "project_id" | "configuration_version_id" | "configuration_row_version" | "prices">,
+  ): Promise<ProjectProduct> {
+    return request(session, `/projects/${configuration.project_id}/products`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...values,
+        configuration_version_id: configuration.id,
+        expected_configuration_version: configuration.row_version,
+      }),
+    });
+  },
+  updateProduct(
+    session: Session,
+    configuration: ProjectConfiguration,
+    product: ProjectProduct,
+  ): Promise<ProjectProduct> {
+    return request(session, `/project-products/${product.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        ...product,
+        expected_configuration_version: configuration.row_version,
+      }),
+    });
+  },
+  deleteProduct(
+    session: Session,
+    configuration: ProjectConfiguration,
+    productId: string,
+  ): Promise<{ configuration_row_version: number }> {
+    return request(session, `/project-products/${productId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expected_configuration_version: configuration.row_version }),
+    });
+  },
+  createProductPrice(
+    session: Session,
+    configuration: ProjectConfiguration,
+    productId: string,
+    price: Omit<ProductPrice, "id" | "project_product_id">,
+  ): Promise<ProjectProduct> {
+    return request(session, `/project-products/${productId}/prices`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...price,
+        expected_configuration_version: configuration.row_version,
+      }),
+    });
+  },
+  deleteProductPrice(
+    session: Session,
+    configuration: ProjectConfiguration,
+    priceId: string,
+  ): Promise<ProjectProduct> {
+    return request(session, `/product-prices/${priceId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expected_configuration_version: configuration.row_version }),
+    });
   },
   getReport(session: Session, reportId: string): Promise<Report> {
     return request(session, `/daily-reports/${reportId}`);

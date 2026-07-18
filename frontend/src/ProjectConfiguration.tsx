@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { ApiError, api, type Session } from "./api";
+import ProductPricingGrid from "./ProductPricingGrid";
 import type {
   BasicInterval,
   ConfigurationReadiness,
@@ -23,15 +24,17 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   const [readiness, setReadiness] = useState<ConfigurationReadiness>();
   const [message, setMessage] = useState("Loading configuration…");
   const [dirty, setDirty] = useState(false);
-  const [pending, setPending] = useState<"create" | "save" | "validate" | "activate">();
+  const [productDirty, setProductDirty] = useState(false);
+  const [pending, setPending] = useState<"create" | "save" | "validate" | "activate" | "product">();
   const pendingRef = useRef(false);
+  const productDirtyRef = useRef(false);
   const createKey = useRef(crypto.randomUUID());
   const activationKey = useRef(crypto.randomUUID());
   const mutable = configuration?.state === "draft";
   const busy = pending !== undefined;
   const projectDepthUnit: "m" | "ft" = project?.unit_set === "Field" ? "ft" : "m";
 
-  function beginPending(operation: "create" | "save" | "validate" | "activate") {
+  function beginPending(operation: "create" | "save" | "validate" | "activate" | "product") {
     if (pendingRef.current) return false;
     pendingRef.current = true;
     setPending(operation);
@@ -41,6 +44,31 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   function endPending() {
     pendingRef.current = false;
     setPending(undefined);
+  }
+
+  function setProductPending(value: boolean) {
+    if (value) {
+      pendingRef.current = true;
+      setPending("product");
+    } else {
+      endPending();
+    }
+  }
+
+  function productSaved(rowVersion: number) {
+    setConfiguration((current) => current ? { ...current, row_version: rowVersion } : current);
+    activationKey.current = crypto.randomUUID();
+    setReadiness(undefined);
+    setMessage("Saved");
+  }
+
+  function productDirtyChanged(value: boolean) {
+    productDirtyRef.current = value;
+    setProductDirty(value);
+    if (value) {
+      setReadiness(undefined);
+      setMessage("Unsaved product or price changes");
+    }
   }
 
   useEffect(() => {
@@ -116,7 +144,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   }
 
   async function validate() {
-    if (!configuration || dirty || !beginPending("validate")) return;
+    if (!configuration || dirty || productDirtyRef.current || !beginPending("validate")) return;
     setMessage("Validating…");
     try {
       setReadiness(await api.validateConfiguration(session, configuration));
@@ -130,7 +158,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   }
 
   async function activate() {
-    if (!configuration || !readiness || dirty || !beginPending("activate")) return;
+    if (!configuration || !readiness || dirty || productDirtyRef.current || !beginPending("activate")) return;
     setMessage("Activating…");
     try {
       const next = await api.activateConfiguration(
@@ -219,10 +247,19 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
               <div className="button-row">
                 <button className="button ghost" disabled={!mutable || busy} onClick={() => updateConfiguration({ ...configuration, data: { ...configuration.data, intervals: [...configuration.data.intervals, newInterval()] } })}>Add interval</button>
                 <button className="button secondary" disabled={!mutable || !dirty || busy} onClick={() => void save()}>Save draft</button>
-                <button className="button ghost" disabled={dirty || busy} onClick={() => void validate()}>Validate readiness</button>
-                <button className="button primary" disabled={!mutable || dirty || busy || readiness?.can_activate !== true || readiness.validated_version !== configuration.row_version} onClick={() => void activate()}>Activate and freeze snapshot</button>
+                <button className="button ghost" disabled={dirty || productDirty || busy} onClick={() => void validate()}>Validate readiness</button>
+                <button className="button primary" disabled={!mutable || dirty || productDirty || busy || readiness?.can_activate !== true || readiness.validated_version !== configuration.row_version} onClick={() => void activate()}>Activate and freeze snapshot</button>
                 {!mutable && <button className="button secondary" disabled={busy} onClick={() => void createDraft()}>Create revised draft</button>}
               </div>
+              <ProductPricingGrid
+                configuration={configuration}
+                currency={project.currency}
+                session={session}
+                disabled={!mutable || busy || dirty}
+                onPendingChange={setProductPending}
+                onSaved={productSaved}
+                onDirtyChange={productDirtyChanged}
+              />
             </section>
             <aside className="panel readiness-panel">
               <div className="panel-heading"><div><span className="eyebrow">Server evaluation</span><h2>Activation readiness</h2></div><span className={`state-badge state-${readiness?.state ?? "incomplete"}`}>{readiness?.state ?? "not checked"}</span></div>

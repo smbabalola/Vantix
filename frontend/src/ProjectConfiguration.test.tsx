@@ -52,6 +52,7 @@ describe("project configuration workspace", () => {
         snapshot_id: null,
         checksum: null,
       }]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => response({
         state: "ready",
         can_activate: true,
@@ -64,6 +65,7 @@ describe("project configuration workspace", () => {
 
     expect(await screen.findByLabelText("Top MD (optional)")).toHaveAttribute("placeholder", "Unavailable");
     expect(screen.getByLabelText(/top md unit/i)).toHaveValue("m");
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     const activate = screen.getByRole("button", { name: /activate and freeze snapshot/i });
     expect(activate).toBeDisabled();
 
@@ -121,6 +123,7 @@ describe("project configuration workspace", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => response(project))
       .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => response({
         state: "ready",
         can_activate: true,
@@ -137,6 +140,7 @@ describe("project configuration workspace", () => {
       }));
 
     render(<ProjectConfiguration projectId={project.id} session={session} />);
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: /validate readiness/i }));
     const activate = screen.getByRole("button", { name: /activate and freeze snapshot/i });
     await waitFor(() => expect(activate).toBeEnabled());
@@ -196,10 +200,12 @@ describe("project configuration workspace", () => {
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => response(project))
       .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => deferredSave);
 
     render(<ProjectConfiguration projectId={project.id} session={session} />);
     const intervalName = await screen.findByLabelText("Interval name");
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     fireEvent.change(intervalName, { target: { value: "Saved interval" } });
     fireEvent.click(screen.getByRole("button", { name: /save draft/i }));
 
@@ -219,5 +225,91 @@ describe("project configuration workspace", () => {
     expect(await screen.findByText("Saved")).toBeInTheDocument();
     await waitFor(() => expect(intervalName).toBeEnabled());
     expect(intervalName).toHaveValue("Saved interval");
+  });
+
+  it("VTX-PRO-001 clears readiness and blocks activation for an unsaved product edit", async () => {
+    const project = {
+      id: "00000000-0000-4000-8000-000000000040",
+      organisation_id: session.organisationId,
+      project_code: "NS-D",
+      project_name: "North Sea D",
+      well_name: "D-01",
+      time_zone: "Europe/London",
+      currency: "GBP",
+      unit_set: "Metric",
+      status: "draft",
+      current_configuration_version_id: null,
+      active_configuration_snapshot_id: null,
+    };
+    const configuration = {
+      id: "00000000-0000-4000-8000-000000000041",
+      project_id: project.id,
+      version: 1,
+      state: "draft",
+      row_version: 3,
+      data: {
+        default_interval_id: "00000000-0000-4000-8000-000000000042",
+        intervals: [{
+          id: "00000000-0000-4000-8000-000000000042",
+          name: "Product interval",
+          operation_mode: "drilling",
+        }],
+      },
+      change_summary: null,
+      snapshot_id: null,
+      checksum: null,
+    };
+    const product = {
+      id: "00000000-0000-4000-8000-000000000043",
+      product_definition_id: "00000000-0000-4000-8000-000000000044",
+      project_id: project.id,
+      configuration_version_id: configuration.id,
+      configuration_row_version: 3,
+      item_code: "BAR-001",
+      item_name: "Barite",
+      alternate_name: null,
+      packaging: "sack",
+      package_size: "25",
+      package_unit_code: "kg",
+      inventory_applicable: true,
+      inventory_unit_code: "package",
+      specific_gravity: "4.2",
+      active: true,
+      prices: [{
+        id: "00000000-0000-4000-8000-000000000045",
+        project_product_id: "00000000-0000-4000-8000-000000000043",
+        effective_from: "2026-01-01",
+        effective_to: null,
+        unit_price: "18.5",
+        currency: "GBP",
+        price_basis_unit_code: "t",
+        source: null,
+      }],
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => response(project))
+      .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => response([product]))
+      .mockImplementationOnce(() => response({
+        state: "ready",
+        can_activate: true,
+        validated_version: 3,
+        draft_checksum: "d".repeat(64),
+        issues: [],
+      }));
+
+    render(<ProjectConfiguration projectId={project.id} session={session} />);
+    expect(await screen.findByText("Product authority loaded")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /validate readiness/i }));
+    const activate = screen.getByRole("button", { name: /activate and freeze snapshot/i });
+    await waitFor(() => expect(activate).toBeEnabled());
+
+    fireEvent.change(screen.getByLabelText("Size"), { target: { value: "50" } });
+
+    expect(activate).toBeDisabled();
+    expect(screen.getByRole("button", { name: /validate readiness/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /save product/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /discard edits/i })).toBeEnabled();
+    expect(screen.getByText("Unsaved product or price changes")).toBeInTheDocument();
   });
 });
