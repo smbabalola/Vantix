@@ -64,14 +64,14 @@ export interface Project {
 
 export interface EnteredDepth {
   value: string;
-  unit: string;
+  unit: "m" | "ft";
   provenance: "entered";
 }
 
 export interface BasicInterval {
   id: string;
   name: string;
-  operation_mode: string;
+  operation_mode: "drilling" | "completion" | "workover";
   top_md?: EnteredDepth;
   bottom_md?: EnteredDepth;
 }
@@ -91,6 +91,8 @@ export interface ProjectConfiguration {
 export interface ConfigurationReadiness {
   state: "ready" | "incomplete";
   can_activate: boolean;
+  validated_version: number;
+  draft_checksum: string;
   issues: Array<{ code: string; field: string; message: string; severity: string }>;
 }
 

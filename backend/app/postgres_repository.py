@@ -234,7 +234,7 @@ class PostgresFoundationRepository:
             location_text=project.location_text,
             time_zone=project.time_zone,
             currency=project.currency,
-            unit_set=project.unit_set,
+            unit_set=cast(Any, project.unit_set),
             reporting_start_date=project.reporting_start_date,
             status=project.status,
             row_version=project.row_version,
@@ -430,8 +430,14 @@ class PostgresFoundationRepository:
             return self._project_view(self._project(session, auth, project_id))
 
     def create_configuration(
-        self, auth: AuthContext, project_id: UUID, body: ConfigurationCreate
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        body: ConfigurationCreate,
+        idempotency_key: str,
     ) -> ConfigurationView:
+        request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+        request_hash = _request_hash(request)
         with self._transaction(auth, project_ids=(project_id,)) as session:
             project = session.scalar(
                 select(Project).where(Project.id == project_id).with_for_update()
@@ -442,12 +448,23 @@ class PostgresFoundationRepository:
                 session, auth, project_id
             ):
                 raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "create_configuration", idempotency_key, request_hash
+            )
+            if existing:
+                return ConfigurationView.model_validate(existing.response_json)
             latest = session.scalar(
                 select(ConfigurationVersion)
                 .where(ConfigurationVersion.project_id == project_id)
                 .order_by(ConfigurationVersion.version_number.desc())
                 .limit(1)
             )
+            if latest is not None and latest.state == "draft":
+                raise _error(
+                    status.HTTP_409_CONFLICT,
+                    "CONFIGURATION_DRAFT_EXISTS",
+                    "Update the existing draft before creating another revision.",
+                )
             active = None
             if project.current_configuration_version_id:
                 active = session.get(ConfigurationVersion, project.current_configuration_version_id)
@@ -478,7 +495,19 @@ class PostgresFoundationRepository:
                 before=None,
                 after={"version": configuration.version_number, "state": "draft"},
             )
-            return self._configuration_view(session, configuration)
+            view = self._configuration_view(session, configuration)
+            self._remember_idempotency(
+                session,
+                auth,
+                "create_configuration",
+                idempotency_key,
+                request_hash,
+                "project_configuration_version",
+                configuration.id,
+                view,
+                response_status=201,
+            )
+            return view
 
     def list_configurations(self, auth: AuthContext, project_id: UUID) -> list[ConfigurationView]:
         with self._transaction(auth, project_ids=(project_id,)) as session:
@@ -570,6 +599,8 @@ class PostgresFoundationRepository:
             return ConfigurationReadinessView(
                 state=readiness.state,
                 can_activate=readiness.can_activate,
+                validated_version=configuration.row_version,
+                draft_checksum=payload_checksum(configuration.data),
                 issues=[asdict(issue) for issue in readiness.issues],
             )
 
@@ -579,15 +610,17 @@ class PostgresFoundationRepository:
         project_id: UUID,
         version_id: UUID,
         idempotency_key: str,
+        expected_version: int,
+        expected_checksum: str,
     ) -> ConfigurationView:
-        request = {"project_id": str(project_id), "version_id": str(version_id)}
+        request = {
+            "project_id": str(project_id),
+            "version_id": str(version_id),
+            "expected_version": expected_version,
+            "expected_checksum": expected_checksum,
+        }
         request_hash = _request_hash(request)
         with self._transaction(auth, project_ids=(project_id,)) as session:
-            existing = self._lock_idempotency(
-                session, auth, "activate_configuration", idempotency_key, request_hash
-            )
-            if existing:
-                return ConfigurationView.model_validate(existing.response_json)
             project = session.scalar(
                 select(Project).where(Project.id == project_id).with_for_update()
             )
@@ -597,6 +630,11 @@ class PostgresFoundationRepository:
                 session, auth, project_id
             ):
                 raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "activate_configuration", idempotency_key, request_hash
+            )
+            if existing:
+                return ConfigurationView.model_validate(existing.response_json)
             configuration = session.scalar(
                 select(ConfigurationVersion)
                 .where(
@@ -609,6 +647,29 @@ class PostgresFoundationRepository:
                 raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
             if configuration.state != "draft":
                 raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_NOT_DRAFT")
+            if (
+                configuration.row_version != expected_version
+                or payload_checksum(configuration.data) != expected_checksum
+            ):
+                raise _error(
+                    status.HTTP_412_PRECONDITION_FAILED,
+                    "CONFIGURATION_VERSION_CONFLICT",
+                    "Configuration changed after it was reviewed.",
+                )
+            latest = session.scalar(
+                select(ConfigurationVersion)
+                .where(ConfigurationVersion.project_id == project_id)
+                .order_by(ConfigurationVersion.version_number.desc())
+                .limit(1)
+            )
+            if latest is None or latest.id != configuration.id:
+                raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_NOT_LATEST")
+            if project.current_configuration_version_id:
+                current = session.get(
+                    ConfigurationVersion, project.current_configuration_version_id
+                )
+                if current is not None and configuration.version_number <= current.version_number:
+                    raise _error(status.HTTP_409_CONFLICT, "CONFIGURATION_VERSION_REGRESSION")
             readiness = validate_project_configuration(
                 self._project_configuration_data(project), configuration.data
             )

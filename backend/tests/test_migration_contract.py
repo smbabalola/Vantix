@@ -56,3 +56,19 @@ def test_vtx_prj_003_004_configuration_lifecycle_is_guarded_and_reversible() -> 
     downgrade = CONFIGURATION_LIFECYCLE.split("def downgrade()", maxsplit=1)[1]
     assert "DROP TRIGGER IF EXISTS project_configuration_versions_guard" in downgrade
     assert "DROP FUNCTION IF EXISTS vantix_guard_configuration_mutation()" in downgrade
+
+
+def test_vtx_auth_006_membership_rls_never_trusts_context_project_ids() -> None:
+    assert "project_memberships_select_scope" in CONFIGURATION_LIFECYCLE
+    assert "project_memberships_insert_scope" in CONFIGURATION_LIFECYCLE
+    select_policy = CONFIGURATION_LIFECYCLE.split(
+        "CREATE POLICY project_memberships_select_scope", maxsplit=1
+    )[1].split("CREATE POLICY project_memberships_insert_scope", maxsplit=1)[0]
+    assert "app.current_project_ids" not in select_policy
+
+
+def test_vtx_prj_003_same_project_constraint_triggers_are_reversible() -> None:
+    assert "vantix_enforce_same_project_ownership" in CONFIGURATION_LIFECYCLE
+    assert "daily_report_revisions_snapshot_same_project" in CONFIGURATION_LIFECYCLE
+    downgrade = CONFIGURATION_LIFECYCLE.split("def downgrade()", maxsplit=1)[1]
+    assert "DROP FUNCTION IF EXISTS vantix_enforce_same_project_ownership()" in downgrade

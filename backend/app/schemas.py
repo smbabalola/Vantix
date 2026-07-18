@@ -26,7 +26,7 @@ class ProjectCreate(BaseModel):
     location_text: str | None = Field(default=None, max_length=500)
     time_zone: str
     currency: str = Field(min_length=3, max_length=3)
-    unit_set: str
+    unit_set: Literal["Metric", "Field"]
     reporting_start_date: date | None = None
 
 
@@ -41,14 +41,14 @@ class ProjectView(ProjectCreate):
 
 class UnitValue(BaseModel):
     value: str
-    unit: str = Field(min_length=1, max_length=30)
+    unit: Literal["m", "ft"]
     provenance: Literal["entered"] = "entered"
 
 
 class BasicInterval(BaseModel):
     id: UUID
     name: str = Field(min_length=1, max_length=200)
-    operation_mode: str = Field(min_length=1, max_length=100)
+    operation_mode: Literal["drilling", "completion", "workover"]
     top_md: UnitValue | None = None
     bottom_md: UnitValue | None = None
 
@@ -87,7 +87,14 @@ class ConfigurationView(BaseModel):
 class ConfigurationReadinessView(BaseModel):
     state: Literal["ready", "incomplete"]
     can_activate: bool
+    validated_version: int
+    draft_checksum: str
     issues: list[dict[str, Any]]
+
+
+class ConfigurationActivation(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_checksum: str = Field(min_length=64, max_length=64)
 
 
 class DailyReportCreate(BaseModel):

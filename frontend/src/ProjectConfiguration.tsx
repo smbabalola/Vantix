@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ApiError, api, type Session } from "./api";
 import type {
@@ -22,14 +22,20 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
   const [configuration, setConfiguration] = useState<Configuration>();
   const [readiness, setReadiness] = useState<ConfigurationReadiness>();
   const [message, setMessage] = useState("Loading configuration…");
+  const [dirty, setDirty] = useState(false);
+  const [pending, setPending] = useState<"create" | "save" | "validate" | "activate">();
+  const createKey = useRef(crypto.randomUUID());
+  const activationKey = useRef(crypto.randomUUID());
   const mutable = configuration?.state === "draft";
-  const projectDepthUnit = project?.unit_set.toLowerCase().includes("field") ? "ft" : "m";
+  const busy = pending !== undefined;
+  const projectDepthUnit: "m" | "ft" = project?.unit_set === "Field" ? "ft" : "m";
 
   useEffect(() => {
     Promise.all([api.getProject(session, projectId), api.listConfigurations(session, projectId)])
       .then(([nextProject, versions]) => {
         setProject(nextProject);
         setConfiguration(versions.find((item) => item.state === "draft") ?? versions[0]);
+        setDirty(false);
         setMessage(versions.length ? "Saved" : "Create a draft configuration to begin.");
       })
       .catch((error) => setMessage(error instanceof Error ? error.message : "Unable to load."));
@@ -47,31 +53,44 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
       },
     });
     setReadiness(undefined);
+    setDirty(true);
     setMessage("Unsaved changes");
   }
 
   function updateConfiguration(next: Configuration) {
     setConfiguration(next);
     setReadiness(undefined);
+    setDirty(true);
     setMessage("Unsaved changes");
   }
 
   async function createDraft() {
+    if (busy) return;
+    setPending("create");
     setMessage("Creating draft…");
     try {
-      setConfiguration(await api.createConfiguration(session, projectId));
+      setConfiguration(await api.createConfiguration(session, projectId, createKey.current));
+      createKey.current = crypto.randomUUID();
+      activationKey.current = crypto.randomUUID();
       setReadiness(undefined);
+      setDirty(false);
       setMessage("Draft created");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unable to create draft.");
+    } finally {
+      setPending(undefined);
     }
   }
 
   async function save() {
-    if (!configuration) return;
+    if (!configuration || !dirty || busy) return;
+    setPending("save");
     setMessage("Saving…");
     try {
-      setConfiguration(await api.saveConfiguration(session, configuration));
+      const saved = await api.saveConfiguration(session, configuration);
+      setConfiguration(saved);
+      activationKey.current = crypto.randomUUID();
+      setDirty(false);
       setMessage("Saved");
     } catch (error) {
       setMessage(
@@ -79,24 +98,65 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
           ? "Conflict — reload before saving"
           : error instanceof Error ? error.message : "Save failed",
       );
+    } finally {
+      setPending(undefined);
     }
   }
 
   async function validate() {
-    if (!configuration) return;
-    setReadiness(await api.validateConfiguration(session, configuration));
+    if (!configuration || dirty || busy) return;
+    setPending("validate");
+    setMessage("Validating…");
+    try {
+      setReadiness(await api.validateConfiguration(session, configuration));
+      setMessage("Validation complete");
+    } catch (error) {
+      setReadiness(undefined);
+      setMessage(error instanceof Error ? error.message : "Validation failed");
+    } finally {
+      setPending(undefined);
+    }
   }
 
   async function activate() {
-    if (!configuration) return;
+    if (!configuration || !readiness || dirty || busy) return;
+    setPending("activate");
     setMessage("Activating…");
     try {
-      const next = await api.activateConfiguration(session, configuration);
+      const next = await api.activateConfiguration(
+        session,
+        configuration,
+        readiness,
+        activationKey.current,
+      );
       setConfiguration(next);
+      setReadiness(undefined);
+      setDirty(false);
       setMessage("Active snapshot frozen");
     } catch (error) {
+      if (error instanceof ApiError && error.code === "CONFIGURATION_VERSION_CONFLICT") {
+        setReadiness(undefined);
+      }
       setMessage(error instanceof Error ? error.message : "Activation failed");
+    } finally {
+      setPending(undefined);
     }
+  }
+
+  function removeInterval(id: string) {
+    if (!configuration) return;
+    const intervals = configuration.data.intervals.filter((item) => item.id !== id);
+    updateConfiguration({
+      ...configuration,
+      data: {
+        ...configuration.data,
+        intervals,
+        default_interval_id:
+          configuration.data.default_interval_id === id
+            ? (intervals[0]?.id ?? null)
+            : configuration.data.default_interval_id,
+      },
+    });
   }
 
   if (!project) return <main className="empty-shell"><div className="brand-mark">V</div><p>{message}</p></main>;
@@ -127,7 +187,7 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
         </section>
 
         {!configuration ? (
-          <section className="panel form-panel"><h2>No configuration revision</h2><p className="muted">Create the first draft. Activation remains unavailable until the server confirms readiness.</p><button className="button primary" onClick={() => void createDraft()}>Create draft configuration</button></section>
+          <section className="panel form-panel"><h2>No configuration revision</h2><p className="muted">Create the first draft. Activation remains unavailable until the server confirms readiness.</p><button className="button primary" disabled={busy} onClick={() => void createDraft()}>Create draft configuration</button></section>
         ) : (
           <div className="content-grid">
             <section className="panel form-panel">
@@ -138,19 +198,20 @@ export default function ProjectConfiguration({ projectId, session }: Props) {
                   <legend>{interval.name || "New interval"}</legend>
                   <div className="form-grid">
                     <label>Interval name<input value={interval.name} onChange={(event) => updateInterval(interval.id, { name: event.target.value })} /></label>
-                    <label>Operation mode<input value={interval.operation_mode} onChange={(event) => updateInterval(interval.id, { operation_mode: event.target.value })} /></label>
-                    <label>Top MD ({interval.top_md?.unit ?? projectDepthUnit}, optional)<input inputMode="decimal" value={interval.top_md?.value ?? ""} onChange={(event) => updateInterval(interval.id, { top_md: event.target.value ? { value: event.target.value, unit: interval.top_md?.unit ?? projectDepthUnit, provenance: "entered" } : undefined })} placeholder="Unavailable" /></label>
-                    <label>Bottom MD ({interval.bottom_md?.unit ?? interval.top_md?.unit ?? projectDepthUnit}, optional)<input inputMode="decimal" value={interval.bottom_md?.value ?? ""} onChange={(event) => updateInterval(interval.id, { bottom_md: event.target.value ? { value: event.target.value, unit: interval.bottom_md?.unit ?? interval.top_md?.unit ?? projectDepthUnit, provenance: "entered" } : undefined })} placeholder="Unavailable" /></label>
+                    <label>Operation mode<select value={interval.operation_mode} onChange={(event) => updateInterval(interval.id, { operation_mode: event.target.value as BasicInterval["operation_mode"] })}><option value="drilling">Drilling</option><option value="completion">Completion</option><option value="workover">Workover</option></select></label>
+                    <label>Top MD (optional)<span className="unit-input"><input inputMode="decimal" min="0" value={interval.top_md?.value ?? ""} onChange={(event) => updateInterval(interval.id, { top_md: event.target.value ? { value: event.target.value, unit: interval.top_md?.unit ?? projectDepthUnit, provenance: "entered" } : undefined })} placeholder="Unavailable" /><select aria-label={`Top MD unit for ${interval.name || "new interval"}`} value={interval.top_md?.unit ?? projectDepthUnit} onChange={(event) => interval.top_md && updateInterval(interval.id, { top_md: { ...interval.top_md, unit: event.target.value as "m" | "ft" } })}><option value="m">m</option><option value="ft">ft</option></select></span></label>
+                    <label>Bottom MD (optional)<span className="unit-input"><input inputMode="decimal" min="0" value={interval.bottom_md?.value ?? ""} onChange={(event) => updateInterval(interval.id, { bottom_md: event.target.value ? { value: event.target.value, unit: interval.bottom_md?.unit ?? interval.top_md?.unit ?? projectDepthUnit, provenance: "entered" } : undefined })} placeholder="Unavailable" /><select aria-label={`Bottom MD unit for ${interval.name || "new interval"}`} value={interval.bottom_md?.unit ?? interval.top_md?.unit ?? projectDepthUnit} onChange={(event) => interval.bottom_md && updateInterval(interval.id, { bottom_md: { ...interval.bottom_md, unit: event.target.value as "m" | "ft" } })}><option value="m">m</option><option value="ft">ft</option></select></span></label>
                   </div>
                   <label className="default-choice"><input type="radio" name="default-interval" checked={configuration.data.default_interval_id === interval.id} onChange={() => updateConfiguration({ ...configuration, data: { ...configuration.data, default_interval_id: interval.id } })} /> Default interval for new report days</label>
+                  <button className="button danger remove-interval" type="button" disabled={!mutable || busy} onClick={() => removeInterval(interval.id)}>Remove interval</button>
                 </fieldset>
               ))}
               <div className="button-row">
-                <button className="button ghost" disabled={!mutable} onClick={() => updateConfiguration({ ...configuration, data: { ...configuration.data, intervals: [...configuration.data.intervals, newInterval()] } })}>Add interval</button>
-                <button className="button secondary" disabled={!mutable} onClick={() => void save()}>Save draft</button>
-                <button className="button ghost" onClick={() => void validate()}>Validate readiness</button>
-                <button className="button primary" disabled={!mutable || readiness?.can_activate !== true} onClick={() => void activate()}>Activate and freeze snapshot</button>
-                {!mutable && <button className="button secondary" onClick={() => void createDraft()}>Create revised draft</button>}
+                <button className="button ghost" disabled={!mutable || busy} onClick={() => updateConfiguration({ ...configuration, data: { ...configuration.data, intervals: [...configuration.data.intervals, newInterval()] } })}>Add interval</button>
+                <button className="button secondary" disabled={!mutable || !dirty || busy} onClick={() => void save()}>Save draft</button>
+                <button className="button ghost" disabled={dirty || busy} onClick={() => void validate()}>Validate readiness</button>
+                <button className="button primary" disabled={!mutable || dirty || busy || readiness?.can_activate !== true || readiness.validated_version !== configuration.row_version} onClick={() => void activate()}>Activate and freeze snapshot</button>
+                {!mutable && <button className="button secondary" disabled={busy} onClick={() => void createDraft()}>Create revised draft</button>}
               </div>
             </section>
             <aside className="panel readiness-panel">

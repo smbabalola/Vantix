@@ -8,6 +8,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from vantix_core.canonical import payload_checksum
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
     DailyReport,
@@ -20,6 +21,7 @@ from .config import get_settings
 from .postgres_repository import PostgresFoundationRepository, postgres_repository
 from .renderers import render_report
 from .schemas import (
+    ConfigurationActivation,
     ConfigurationCreate,
     ConfigurationPatch,
     ConfigurationReadinessView,
@@ -69,7 +71,7 @@ def _project_view(project: ProjectRecord) -> ProjectView:
         location_text=project.location_text,
         time_zone=project.time_zone,
         currency=project.currency,
-        unit_set=project.unit_set,
+        unit_set=cast(Any, project.unit_set),
         reporting_start_date=project.reporting_start_date,
         status="active" if project.active_snapshot else "draft",
         active_configuration_snapshot_id=(
@@ -238,22 +240,40 @@ def create_configuration(
     body: ConfigurationCreate,
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ConfigurationView:
     if isinstance(repository, PostgresFoundationRepository):
-        return repository.create_configuration(auth, project_id, body)
+        return repository.create_configuration(auth, project_id, body, idempotency_key)
     auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
-    version = len(project.configuration_versions) + 1
-    data = body.data.model_dump(mode="json", exclude_none=True) if body.data else {}
-    record = {"id": uuid4(), "version": version, "state": "draft", "data": data}
-    project.configuration_versions.append(record)
-    return ConfigurationView(
-        id=cast(UUID, record["id"]),
-        project_id=project.id,
-        version=cast(int, record["version"]),
-        state=cast(Any, record["state"]),
-        row_version=1,
-        data=data,
+    request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+
+    def create() -> ConfigurationView:
+        if any(item["state"] == "draft" for item in project.configuration_versions):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "CONFIGURATION_DRAFT_EXISTS"},
+            )
+        version = len(project.configuration_versions) + 1
+        data = body.data.model_dump(mode="json", exclude_none=True) if body.data else {}
+        record = {"id": uuid4(), "version": version, "state": "draft", "data": data}
+        project.configuration_versions.append(record)
+        return ConfigurationView(
+            id=cast(UUID, record["id"]),
+            project_id=project.id,
+            version=cast(int, record["version"]),
+            state=cast(Any, record["state"]),
+            row_version=1,
+            data=data,
+        )
+
+    return _idempotent(
+        repository,
+        auth,
+        "create_configuration",
+        idempotency_key,
+        request,
+        create,
     )
 
 
@@ -321,12 +341,20 @@ def validate_configuration(
 def activate_configuration(
     project_id: UUID,
     version_id: UUID,
+    body: ConfigurationActivation,
     auth: AuthContext = Depends(auth_context),
     repository: Repository = Depends(get_store),
     idempotency_key: str = Header(alias="Idempotency-Key"),
 ) -> ConfigurationView:
     if isinstance(repository, PostgresFoundationRepository):
-        return repository.activate_configuration(auth, project_id, version_id, idempotency_key)
+        return repository.activate_configuration(
+            auth,
+            project_id,
+            version_id,
+            idempotency_key,
+            body.expected_version,
+            body.expected_checksum,
+        )
     auth.require(Capability.CONFIGURE_PROJECT)
     project = _project(project_id, auth, repository)
     record = next(
@@ -336,6 +364,14 @@ def activate_configuration(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "CONFIGURATION_NOT_FOUND"})
 
     def activate() -> ConfigurationView:
+        if (
+            cast(int, record.get("row_version", 1)) != body.expected_version
+            or payload_checksum(cast(dict[str, Any], record["data"])) != body.expected_checksum
+        ):
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED,
+                detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+            )
         snapshot = ConfigurationSnapshot.create(
             project.id,
             cast(int, record["version"]),
@@ -359,7 +395,11 @@ def activate_configuration(
         auth,
         "activate_configuration",
         idempotency_key,
-        {"project_id": str(project_id), "version_id": str(version_id)},
+        {
+            "project_id": str(project_id),
+            "version_id": str(version_id),
+            **body.model_dump(),
+        },
         activate,
     )
 

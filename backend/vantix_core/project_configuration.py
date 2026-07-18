@@ -37,6 +37,10 @@ PROJECT_REQUIRED_FIELDS = (
     "unit_set",
 )
 
+UNIT_SET_LENGTH_UNITS = {"Metric": "m", "Field": "ft"}
+LENGTH_UNITS = frozenset(UNIT_SET_LENGTH_UNITS.values())
+OPERATION_MODES = frozenset({"drilling", "completion", "workover"})
+
 
 def _depth_value(
     interval: Mapping[str, Any], field: str, index: int, issues: list[ConfigurationIssue]
@@ -63,6 +67,15 @@ def _depth_value(
             ConfigurationIssue("DEPTH_UNIT_REQUIRED", f"{path}.unit", "Depth unit is required.")
         )
         return None
+    if unit not in LENGTH_UNITS:
+        issues.append(
+            ConfigurationIssue(
+                "DEPTH_UNIT_UNRECOGNISED",
+                f"{path}.unit",
+                "Depth unit must be m or ft.",
+            )
+        )
+        return None
     if provenance != "entered":
         issues.append(
             ConfigurationIssue(
@@ -83,7 +96,21 @@ def _depth_value(
             )
         )
         return None
+    if parsed < 0:
+        issues.append(
+            ConfigurationIssue(
+                "NEGATIVE_MEASURED_DEPTH",
+                f"{path}.value",
+                "Measured depth cannot be negative.",
+            )
+        )
+        return None
     return parsed, unit.strip()
+
+
+def _canonical_decimal(value: str) -> str:
+    parsed = Decimal(value)
+    return "0" if parsed == 0 else format(parsed.normalize(), "f")
 
 
 def validate_project_configuration(
@@ -100,6 +127,16 @@ def validate_project_configuration(
                     "PROJECT_FIELD_REQUIRED", f"project.{field}", f"{field} is required."
                 )
             )
+
+    expected_depth_unit = UNIT_SET_LENGTH_UNITS.get(str(project.get("unit_set")))
+    if expected_depth_unit is None:
+        issues.append(
+            ConfigurationIssue(
+                "UNIT_SET_UNSUPPORTED",
+                "project.unit_set",
+                "Unit set must be Metric or Field.",
+            )
+        )
 
     intervals = data.get("intervals")
     if not isinstance(intervals, list) or not intervals:
@@ -146,9 +183,27 @@ def validate_project_configuration(
                         "INTERVAL_FIELD_REQUIRED", f"{path}.{field}", f"{field} is required."
                     )
                 )
+        operation_mode = raw_interval.get("operation_mode")
+        if isinstance(operation_mode, str) and operation_mode not in OPERATION_MODES:
+            issues.append(
+                ConfigurationIssue(
+                    "OPERATION_MODE_UNRECOGNISED",
+                    f"{path}.operation_mode",
+                    "Operation mode must be drilling, completion, or workover.",
+                )
+            )
 
         top = _depth_value(raw_interval, "top_md", index, issues)
         bottom = _depth_value(raw_interval, "bottom_md", index, issues)
+        for field, depth in (("top_md", top), ("bottom_md", bottom)):
+            if depth and expected_depth_unit and depth[1] != expected_depth_unit:
+                issues.append(
+                    ConfigurationIssue(
+                        "DEPTH_UNIT_PROFILE_MISMATCH",
+                        f"{path}.{field}.unit",
+                        f"Depth unit must match the project profile ({expected_depth_unit}).",
+                    )
+                )
         if top and bottom:
             if top[1] != bottom[1]:
                 issues.append(
@@ -212,6 +267,14 @@ def build_project_snapshot(
     readiness = validate_project_configuration(project, data)
     if not readiness.can_activate:
         raise ValueError("Project configuration is not ready for activation.")
+    intervals = deepcopy(data["intervals"])
+    canonical_unit = UNIT_SET_LENGTH_UNITS[str(project["unit_set"])]
+    for interval in intervals:
+        for field in ("top_md", "bottom_md"):
+            if field in interval:
+                interval[field]["value"] = _canonical_decimal(interval[field]["value"])
+                interval[field]["unit"] = canonical_unit
+
     snapshot = {
         "schema_version": "1.0",
         "organisation_id": str(organisation_id),
@@ -236,6 +299,6 @@ def build_project_snapshot(
             "activated_at": activated_at.isoformat().replace("+00:00", "Z"),
         },
         "default_interval_id": str(data["default_interval_id"]),
-        "intervals": deepcopy(data["intervals"]),
+        "intervals": intervals,
     }
     return snapshot, payload_checksum(snapshot)

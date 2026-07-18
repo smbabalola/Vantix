@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from vantix_core.canonical import payload_checksum
 
 
 def headers(user_id=None, organisation_id=None, capabilities="") -> dict[str, str]:
@@ -32,14 +33,30 @@ def setup_report(client: TestClient):
             "unit_set": "Field",
         },
     ).json()
+    interval_id = str(uuid4())
     configuration = client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions",
-        headers=editor_headers,
-        json={"data": {"project": {"name": "North Sea A"}, "unit_set": {"name": "Field"}}},
+        headers={**editor_headers, "Idempotency-Key": "create-config-1"},
+        json={
+            "data": {
+                "default_interval_id": interval_id,
+                "intervals": [
+                    {
+                        "id": interval_id,
+                        "name": "Surface interval",
+                        "operation_mode": "drilling",
+                    }
+                ],
+            }
+        },
     ).json()
     client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions/{configuration['id']}/activate",
         headers={**editor_headers, "Idempotency-Key": "activate-config-1"},
+        json={
+            "expected_version": configuration["row_version"],
+            "expected_checksum": payload_checksum(configuration["data"]),
+        },
     )
     report = client.post(
         f"/api/v1/projects/{project['id']}/daily-reports",
@@ -65,7 +82,10 @@ def test_vtx_api_003_cross_tenant_project_returns_no_data(client: TestClient) ->
     _, _, _, project, _ = setup_report(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/configuration-versions",
-        headers=headers(capabilities="configure_project"),
+        headers={
+            **headers(capabilities="configure_project"),
+            "Idempotency-Key": "cross-tenant-config",
+        },
         json={"data": {}},
     )
     assert response.status_code == 404

@@ -81,6 +81,7 @@ class Project(TenantMixin, Base):
             "status IN ('draft', 'active', 'inactive', 'archived')",
             name="ck_projects_status",
         ),
+        CheckConstraint("unit_set IN ('Metric', 'Field')", name="ck_projects_unit_set"),
     )
 
 
@@ -122,6 +123,12 @@ class ConfigurationVersion(TenantMixin, Base):
             "project_id",
             unique=True,
             postgresql_where=state == "active",
+        ),
+        Index(
+            "one_draft_configuration_per_project",
+            "project_id",
+            unique=True,
+            postgresql_where=state == "draft",
         ),
     )
 

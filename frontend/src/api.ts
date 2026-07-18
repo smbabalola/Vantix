@@ -49,9 +49,14 @@ export const api = {
   listConfigurations(session: Session, projectId: string): Promise<ProjectConfiguration[]> {
     return request(session, `/projects/${projectId}/configuration-versions`);
   },
-  createConfiguration(session: Session, projectId: string): Promise<ProjectConfiguration> {
+  createConfiguration(
+    session: Session,
+    projectId: string,
+    idempotencyKey: string,
+  ): Promise<ProjectConfiguration> {
     return request(session, `/projects/${projectId}/configuration-versions`, {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ copy_active: true }),
     });
   },
@@ -85,11 +90,20 @@ export const api = {
   activateConfiguration(
     session: Session,
     configuration: ProjectConfiguration,
+    readiness: ConfigurationReadiness,
+    idempotencyKey: string,
   ): Promise<ProjectConfiguration> {
     return request(
       session,
       `/projects/${configuration.project_id}/configuration-versions/${configuration.id}/activate`,
-      { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() } },
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({
+          expected_version: readiness.validated_version,
+          expected_checksum: readiness.draft_checksum,
+        }),
+      },
     );
   },
   getReport(session: Session, reportId: string): Promise<Report> {

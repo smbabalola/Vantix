@@ -61,9 +61,13 @@ Required MVP fields:
 
 Creates mutable configuration version from current active version or blank defaults.
 
+Headers: `Idempotency-Key`.
+
 Optional body fields: `data`, `change_summary`, and `copy_active` (default true). When an active
 version exists and `data` is omitted, the server copies the active structured configuration. The
-response includes draft `row_version`.
+response includes draft `row_version`. A project has at most one draft; a different request while a
+draft exists returns `409 CONFIGURATION_DRAFT_EXISTS`, while retrying the same key returns the
+original draft.
 
 ### `GET /projects/{project_id}/configuration-versions`
 
@@ -81,7 +85,8 @@ Active or superseded versions are locked.
 
 ### `POST /projects/{project_id}/configuration-versions/{version_id}/validate`
 
-Returns activation readiness without changing state. Missing project identity/units, missing basic
+Returns activation readiness without changing state, including `validated_version` and the
+canonical `draft_checksum`. Missing project identity/units, missing basic
 interval/default interval/operation mode, invalid references, and invalid optional depth bounds are
 reported explicitly.
 
@@ -90,6 +95,10 @@ reported explicitly.
 Validates readiness, freezes snapshot/checksum, and sets active version atomically.
 
 Headers: `Idempotency-Key`.
+
+Body: `expected_version` and `expected_checksum` from the validation response. Activation returns
+`412 CONFIGURATION_VERSION_CONFLICT` if the draft changed after validation. Only the latest version,
+newer than the current active version, may activate.
 
 Activation also supersedes the prior active version, records activation actor/time and audit events,
 and updates the project's current configuration version/snapshot pointers in the same transaction.

@@ -81,3 +81,41 @@ def test_vtx_prj_002_depth_bounds_require_units_and_valid_order() -> None:
     readiness = validate_project_configuration(project_identity(), data)
     assert readiness.can_activate is False
     assert any(issue.code == "INTERVAL_DEPTH_ORDER_INVALID" for issue in readiness.issues)
+
+
+def test_vtx_prj_002_rejects_unsafe_units_negative_md_and_free_text_modes() -> None:
+    data = configuration()
+    data["intervals"][0]["operation_mode"] = "sidetrack-ish"
+    data["intervals"][0]["top_md"] = {
+        "value": "-1",
+        "unit": "metres",
+        "provenance": "entered",
+    }
+    readiness = validate_project_configuration(project_identity(), data)
+    codes = {issue.code for issue in readiness.issues}
+    assert "OPERATION_MODE_UNRECOGNISED" in codes
+    assert "DEPTH_UNIT_UNRECOGNISED" in codes
+
+    data["intervals"][0]["top_md"]["unit"] = "m"
+    readiness = validate_project_configuration(project_identity(), data)
+    assert any(issue.code == "NEGATIVE_MEASURED_DEPTH" for issue in readiness.issues)
+
+
+def test_vtx_prj_003_snapshot_canonicalises_depth_decimals() -> None:
+    data = configuration()
+    data["intervals"][0]["top_md"]["value"] = "01000.5000"
+    snapshot, _ = build_project_snapshot(
+        organisation_id=uuid4(),
+        project_id=uuid4(),
+        project=project_identity(),
+        data=data,
+        version_id=uuid4(),
+        version_number=1,
+        activated_by=uuid4(),
+        activated_at=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+    assert snapshot["intervals"][0]["top_md"] == {
+        "value": "1000.5",
+        "unit": "m",
+        "provenance": "entered",
+    }

@@ -28,7 +28,9 @@ snapshot. Later MVP modules extend it through explicit schema versions.
 - at least one interval has UUID, name, and operation mode
 - `default_interval_id` references exactly one configured interval
 - interval IDs are unique
-- optional depth values are finite decimal strings with explicit matching units
+- optional depth values are finite non-negative decimal strings using controlled `m` or `ft` units
+- depth units match the authoritative project profile (`Metric -> m`, `Field -> ft`)
+- operation mode is `drilling`, `completion`, or `workover`
 - when both depth bounds exist, bottom MD is greater than top MD
 
 ## Lifecycle
@@ -44,3 +46,9 @@ Mutable draft version
 Draft updates require optimistic concurrency. Active/superseded data never changes. A new daily
 report revision stores the active snapshot ID at creation and retains it for its full lineage unless
 an explicit draft-only refresh operation is introduced by a later contract.
+
+Each project has at most one mutable draft and one active version. Draft creation is idempotent.
+Validation returns the draft row version and canonical checksum; activation requires both and
+fails if the draft changed. Only the latest version, newer than the active version, may activate.
+All configuration, snapshot, project pointer, report, and revision relationships are constrained to
+the same organisation and project.
