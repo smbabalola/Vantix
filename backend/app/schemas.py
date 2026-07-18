@@ -97,6 +97,71 @@ class ConfigurationActivation(BaseModel):
     expected_checksum: str = Field(min_length=64, max_length=64)
 
 
+ProductUnitCode = Literal["kg", "t", "lb", "L", "m3", "gal_us", "bbl", "each", "package"]
+PackageContentUnitCode = Literal["kg", "t", "lb", "L", "m3", "gal_us", "bbl", "each"]
+PackagingType = Literal["sack", "pail", "drum", "tote", "bulk", "case", "each", "other"]
+
+
+class ProjectProductFields(BaseModel):
+    item_code: str = Field(min_length=1, max_length=100)
+    item_name: str = Field(min_length=1, max_length=200)
+    alternate_name: str | None = Field(default=None, max_length=200)
+    packaging: PackagingType
+    package_size: str
+    package_unit_code: PackageContentUnitCode
+    inventory_applicable: bool
+    inventory_unit_code: ProductUnitCode | None = None
+    specific_gravity: str | None = None
+    active: bool = True
+
+
+class ProjectProductCreate(ProjectProductFields):
+    configuration_version_id: UUID
+    expected_configuration_version: int = Field(ge=1)
+
+
+class ProjectProductPatch(ProjectProductFields):
+    expected_configuration_version: int = Field(ge=1)
+
+
+class ConfigurationVersionExpectation(BaseModel):
+    expected_configuration_version: int = Field(ge=1)
+
+
+class ConfigurationMutationView(BaseModel):
+    configuration_row_version: int
+
+
+class ProductPriceFields(BaseModel):
+    effective_from: date
+    effective_to: date | None = None
+    unit_price: str
+    currency: str = Field(min_length=3, max_length=3)
+    price_basis_unit_code: ProductUnitCode
+    source: str | None = Field(default=None, max_length=200)
+
+
+class ProductPriceCreate(ProductPriceFields):
+    expected_configuration_version: int = Field(ge=1)
+
+
+class ProductPricePatch(ProductPriceFields):
+    expected_configuration_version: int = Field(ge=1)
+
+
+class ProductPriceView(ProductPriceFields):
+    id: UUID
+    project_product_id: UUID
+
+
+class ProjectProductView(ProjectProductFields):
+    id: UUID
+    project_id: UUID
+    configuration_version_id: UUID
+    configuration_row_version: int
+    prices: list[ProductPriceView]
+
+
 class DailyReportCreate(BaseModel):
     report_date: date
     report_number: str = Field(min_length=1, max_length=100)

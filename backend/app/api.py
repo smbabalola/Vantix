@@ -3,20 +3,29 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict
+from datetime import date
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from vantix_core.canonical import payload_checksum
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
     DailyReport,
     LifecycleError,
     ReportRevision,
 )
+from vantix_core.products import (
+    ProductValidationError,
+    canonicalise_product,
+    select_effective_price,
+)
 from vantix_core.project_configuration import (
     ConfigurationActivationError,
     guard_configuration_activation,
+    validate_project_configuration,
 )
 
 from .auth import AuthContext, Capability, auth_context
@@ -26,8 +35,10 @@ from .renderers import render_report
 from .schemas import (
     ConfigurationActivation,
     ConfigurationCreate,
+    ConfigurationMutationView,
     ConfigurationPatch,
     ConfigurationReadinessView,
+    ConfigurationVersionExpectation,
     ConfigurationView,
     DailyReportCreate,
     DecisionRequest,
@@ -36,7 +47,13 @@ from .schemas import (
     ExportView,
     OrganisationCreate,
     OrganisationView,
+    ProductPriceCreate,
+    ProductPricePatch,
+    ProductPriceView,
     ProjectCreate,
+    ProjectProductCreate,
+    ProjectProductPatch,
+    ProjectProductView,
     ProjectView,
     ReadinessView,
     ReportView,
@@ -80,6 +97,65 @@ def _project_view(project: ProjectRecord) -> ProjectView:
         active_configuration_snapshot_id=(
             project.active_snapshot.id if project.active_snapshot else None
         ),
+    )
+
+
+def _memory_configuration(project: ProjectRecord, version_id: UUID) -> dict[str, Any]:
+    record = next(
+        (item for item in project.configuration_versions if item["id"] == version_id), None
+    )
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "CONFIGURATION_NOT_FOUND"})
+    return record
+
+
+def _memory_product_view(
+    repository: FoundationStore, product: dict[str, Any], configuration_version: int
+) -> ProjectProductView:
+    prices = sorted(
+        (
+            price
+            for price in repository.product_prices.values()
+            if price["project_product_id"] == product["id"]
+        ),
+        key=lambda price: (price["effective_from"], str(price["id"])),
+    )
+    return ProjectProductView.model_validate(
+        {
+            **product,
+            "configuration_row_version": configuration_version,
+            "prices": prices,
+        }
+    )
+
+
+def _memory_configuration_payload(
+    repository: FoundationStore, project: ProjectRecord, record: dict[str, Any]
+) -> dict[str, Any]:
+    payload = deepcopy(cast(dict[str, Any], record["data"]))
+    products = sorted(
+        (
+            product
+            for product in repository.project_products.values()
+            if product["configuration_version_id"] == record["id"]
+        ),
+        key=lambda product: (str(product["item_code"]).casefold(), str(product["id"])),
+    )
+    payload["products"] = [
+        _memory_product_view(repository, product, cast(int, record["row_version"])).model_dump(
+            mode="json",
+            exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+            exclude_none=True,
+        )
+        for product in products
+    ]
+    return payload
+
+
+def _product_http_error(exc: ProductValidationError) -> HTTPException:
+    return HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"code": exc.code, "message": str(exc), "field": exc.field},
     )
 
 
@@ -258,7 +334,15 @@ def create_configuration(
                 detail={"code": "CONFIGURATION_DRAFT_EXISTS"},
             )
         version = len(project.configuration_versions) + 1
-        data = body.data.model_dump(mode="json", exclude_none=True) if body.data else {}
+        active = next(
+            (item for item in project.configuration_versions if item["state"] == "active"), None
+        )
+        if body.data is not None:
+            data = body.data.model_dump(mode="json", exclude_none=True)
+        elif body.copy_active and active is not None:
+            data = deepcopy(cast(dict[str, Any], active["data"]))
+        else:
+            data = {"default_interval_id": None, "intervals": []}
         record = {
             "id": uuid4(),
             "version": version,
@@ -267,6 +351,28 @@ def create_configuration(
             "data": data,
         }
         project.configuration_versions.append(record)
+        if body.data is None and body.copy_active and active is not None:
+            active_products = [
+                product
+                for product in repository.project_products.values()
+                if product["configuration_version_id"] == active["id"]
+            ]
+            for source in active_products:
+                source_id = cast(UUID, source["id"])
+                copied_id = uuid4()
+                repository.project_products[copied_id] = {
+                    **deepcopy(source),
+                    "id": copied_id,
+                    "configuration_version_id": record["id"],
+                }
+                for price in list(repository.product_prices.values()):
+                    if price["project_product_id"] == source_id:
+                        copied_price_id = uuid4()
+                        repository.product_prices[copied_price_id] = {
+                            **deepcopy(price),
+                            "id": copied_price_id,
+                            "project_product_id": copied_id,
+                        }
         return ConfigurationView(
             id=cast(UUID, record["id"]),
             project_id=project.id,
@@ -340,7 +446,28 @@ def validate_configuration(
 ) -> ConfigurationReadinessView:
     if isinstance(repository, PostgresFoundationRepository):
         return repository.validate_configuration(auth, project_id, version_id)
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail={"code": "POSTGRES_REQUIRED"})
+    auth.require(Capability.CONFIGURE_PROJECT)
+    project = _project(project_id, auth, repository)
+    record = _memory_configuration(project, version_id)
+    payload = _memory_configuration_payload(repository, project, record)
+    readiness = validate_project_configuration(
+        {
+            "project_code": project.project_code,
+            "project_name": project.project_name,
+            "well_name": project.well_name,
+            "time_zone": project.time_zone,
+            "currency": project.currency,
+            "unit_set": project.unit_set,
+        },
+        payload,
+    )
+    return ConfigurationReadinessView(
+        state=readiness.state,
+        can_activate=readiness.can_activate,
+        validated_version=cast(int, record["row_version"]),
+        draft_checksum=payload_checksum(payload),
+        issues=[asdict(issue) for issue in readiness.issues],
+    )
 
 
 @router.post(
@@ -373,6 +500,7 @@ def activate_configuration(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "CONFIGURATION_NOT_FOUND"})
 
     def activate() -> ConfigurationView:
+        payload = _memory_configuration_payload(repository, project, record)
         try:
             guard_configuration_activation(
                 project={
@@ -383,7 +511,7 @@ def activate_configuration(
                     "currency": project.currency,
                     "unit_set": project.unit_set,
                 },
-                data=cast(dict[str, Any], record["data"]),
+                data=payload,
                 state=cast(str, record["state"]),
                 row_version=cast(int, record["row_version"]),
                 expected_version=body.expected_version,
@@ -408,7 +536,7 @@ def activate_configuration(
         snapshot = ConfigurationSnapshot.create(
             project.id,
             cast(int, record["version"]),
-            cast(dict[str, Any], record["data"]),
+            payload,
         )
         for item in project.configuration_versions:
             if item["state"] == "active":
@@ -438,6 +566,330 @@ def activate_configuration(
         },
         activate,
     )
+
+
+@router.get("/projects/{project_id}/products", response_model=list[ProjectProductView])
+def list_products(
+    project_id: UUID,
+    configuration_version_id: UUID,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> list[ProjectProductView]:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.list_products(auth, project_id, configuration_version_id)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    project = _project(project_id, auth, repository)
+    record = _memory_configuration(project, configuration_version_id)
+    products = sorted(
+        (
+            product
+            for product in repository.project_products.values()
+            if product["configuration_version_id"] == configuration_version_id
+        ),
+        key=lambda product: (str(product["item_code"]).casefold(), str(product["id"])),
+    )
+    return [
+        _memory_product_view(repository, product, cast(int, record["row_version"]))
+        for product in products
+    ]
+
+
+@router.post("/projects/{project_id}/products", response_model=ProjectProductView, status_code=201)
+def create_product(
+    project_id: UUID,
+    body: ProjectProductCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectProductView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.create_product(auth, project_id, body)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    project = _project(project_id, auth, repository)
+    record = _memory_configuration(project, body.configuration_version_id)
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    product_id = uuid4()
+    values = body.model_dump(
+        mode="json",
+        exclude={"configuration_version_id", "expected_configuration_version"},
+        exclude_none=True,
+    )
+    try:
+        canonical = canonicalise_product(
+            {"id": str(product_id), **values, "prices": []},
+            project.currency,
+            require_price=False,
+        )
+    except ProductValidationError as exc:
+        raise _product_http_error(exc) from exc
+    if any(
+        product["configuration_version_id"] == body.configuration_version_id
+        and str(product["item_code"]).casefold() == str(canonical["item_code"]).casefold()
+        for product in repository.project_products.values()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "PRODUCT_CODE_EXISTS"})
+    stored = {
+        **canonical,
+        "id": product_id,
+        "project_id": project_id,
+        "configuration_version_id": body.configuration_version_id,
+    }
+    stored.pop("prices", None)
+    repository.project_products[product_id] = stored
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return _memory_product_view(repository, stored, cast(int, record["row_version"]))
+
+
+@router.patch("/project-products/{product_id}", response_model=ProjectProductView)
+def patch_product(
+    product_id: UUID,
+    body: ProjectProductPatch,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectProductView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.patch_product(auth, product_id, body)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    product = repository.project_products.get(product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PROJECT_PRODUCT_NOT_FOUND"})
+    project = _project(cast(UUID, product["project_id"]), auth, repository)
+    record = _memory_configuration(project, cast(UUID, product["configuration_version_id"]))
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    current = _memory_product_view(
+        repository, product, cast(int, record["row_version"])
+    ).model_dump(
+        mode="json",
+        exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+        exclude_none=True,
+    )
+    values = body.model_dump(
+        mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+    )
+    try:
+        canonical = canonicalise_product(
+            {"id": str(product_id), **values, "prices": current["prices"]},
+            project.currency,
+            require_price=False,
+        )
+    except ProductValidationError as exc:
+        raise _product_http_error(exc) from exc
+    if any(
+        candidate["id"] != product_id
+        and candidate["configuration_version_id"] == product["configuration_version_id"]
+        and str(candidate["item_code"]).casefold() == str(canonical["item_code"]).casefold()
+        for candidate in repository.project_products.values()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "PRODUCT_CODE_EXISTS"})
+    canonical.pop("prices")
+    product.update(canonical)
+    product["id"] = product_id
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return _memory_product_view(repository, product, cast(int, record["row_version"]))
+
+
+@router.delete("/project-products/{product_id}", response_model=ConfigurationMutationView)
+def delete_product(
+    product_id: UUID,
+    body: ConfigurationVersionExpectation,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ConfigurationMutationView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.delete_product(auth, product_id, body)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    product = repository.project_products.get(product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PROJECT_PRODUCT_NOT_FOUND"})
+    project = _project(cast(UUID, product["project_id"]), auth, repository)
+    record = _memory_configuration(project, cast(UUID, product["configuration_version_id"]))
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    for price_id in [
+        key
+        for key, price in repository.product_prices.items()
+        if price["project_product_id"] == product_id
+    ]:
+        del repository.product_prices[price_id]
+    del repository.project_products[product_id]
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return ConfigurationMutationView(configuration_row_version=cast(int, record["row_version"]))
+
+
+@router.post(
+    "/project-products/{product_id}/prices",
+    response_model=ProjectProductView,
+    status_code=201,
+)
+def create_product_price(
+    product_id: UUID,
+    body: ProductPriceCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectProductView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.create_product_price(auth, product_id, body)
+    product = repository.project_products.get(product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PROJECT_PRODUCT_NOT_FOUND"})
+    project = _project(cast(UUID, product["project_id"]), auth, repository)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    record = _memory_configuration(project, cast(UUID, product["configuration_version_id"]))
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    price_id = uuid4()
+    view = _memory_product_view(repository, product, cast(int, record["row_version"]))
+    candidate = view.model_dump(
+        mode="json",
+        exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+        exclude_none=True,
+    )
+    candidate_price = {
+        "id": str(price_id),
+        **body.model_dump(
+            mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+        ),
+    }
+    candidate["prices"] = [*candidate["prices"], candidate_price]
+    try:
+        canonical = canonicalise_product(candidate, project.currency, require_price=False)
+    except ProductValidationError as exc:
+        raise _product_http_error(exc) from exc
+    stored_price = next(item for item in canonical["prices"] if item["id"] == str(price_id))
+    repository.product_prices[price_id] = {
+        **stored_price,
+        "id": price_id,
+        "project_product_id": product_id,
+    }
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return _memory_product_view(repository, product, cast(int, record["row_version"]))
+
+
+@router.get("/project-products/{product_id}/price-at", response_model=ProductPriceView)
+def get_product_price_at(
+    product_id: UUID,
+    date_at: date = Query(alias="date"),
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProductPriceView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.price_at(auth, product_id, date_at)
+    product = repository.project_products.get(product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PROJECT_PRODUCT_NOT_FOUND"})
+    _project(cast(UUID, product["project_id"]), auth, repository)
+    prices = [
+        price
+        for price in repository.product_prices.values()
+        if price["project_product_id"] == product_id
+    ]
+    selected = select_effective_price(prices, date_at)
+    if selected is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PRICE_NOT_EFFECTIVE"})
+    return ProductPriceView.model_validate(selected)
+
+
+@router.patch("/product-prices/{price_id}", response_model=ProjectProductView)
+def patch_product_price(
+    price_id: UUID,
+    body: ProductPricePatch,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectProductView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.patch_product_price(auth, price_id, body)
+    price = repository.product_prices.get(price_id)
+    if price is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PRODUCT_PRICE_NOT_FOUND"})
+    product_id = cast(UUID, price["project_product_id"])
+    product = repository.project_products[product_id]
+    project = _project(cast(UUID, product["project_id"]), auth, repository)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    record = _memory_configuration(project, cast(UUID, product["configuration_version_id"]))
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    view = _memory_product_view(repository, product, cast(int, record["row_version"]))
+    candidate = view.model_dump(
+        mode="json",
+        exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+        exclude_none=True,
+    )
+    replacement = {
+        "id": str(price_id),
+        **body.model_dump(
+            mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+        ),
+    }
+    candidate["prices"] = [
+        replacement if item["id"] == str(price_id) else item for item in candidate["prices"]
+    ]
+    try:
+        canonical = canonicalise_product(candidate, project.currency, require_price=False)
+    except ProductValidationError as exc:
+        raise _product_http_error(exc) from exc
+    updated = next(item for item in canonical["prices"] if item["id"] == str(price_id))
+    repository.product_prices[price_id] = {
+        **updated,
+        "id": price_id,
+        "project_product_id": product_id,
+    }
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return _memory_product_view(repository, product, cast(int, record["row_version"]))
+
+
+@router.delete("/product-prices/{price_id}", response_model=ProjectProductView)
+def delete_product_price(
+    price_id: UUID,
+    body: ConfigurationVersionExpectation,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ProjectProductView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.delete_product_price(auth, price_id, body)
+    price = repository.product_prices.get(price_id)
+    if price is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "PRODUCT_PRICE_NOT_FOUND"})
+    product_id = cast(UUID, price["project_product_id"])
+    product = repository.project_products[product_id]
+    project = _project(cast(UUID, product["project_id"]), auth, repository)
+    auth.require(Capability.CONFIGURE_PROJECT)
+    record = _memory_configuration(project, cast(UUID, product["configuration_version_id"]))
+    if record["state"] != "draft":
+        raise HTTPException(status.HTTP_423_LOCKED, detail={"code": "CONFIGURATION_LOCKED"})
+    if record["row_version"] != body.expected_configuration_version:
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "CONFIGURATION_VERSION_CONFLICT"},
+        )
+    del repository.product_prices[price_id]
+    record["row_version"] = cast(int, record["row_version"]) + 1
+    return _memory_product_view(repository, product, cast(int, record["row_version"]))
 
 
 @router.post("/projects/{project_id}/daily-reports", response_model=ReportView, status_code=201)

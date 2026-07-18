@@ -60,6 +60,8 @@ class FoundationStore:
         self._lock = RLock()
         self.organisations: dict[UUID, OrganisationRecord] = {}
         self.projects: dict[UUID, ProjectRecord] = {}
+        self.project_products: dict[UUID, dict[str, Any]] = {}
+        self.product_prices: dict[UUID, dict[str, Any]] = {}
         self.reports: dict[UUID, DailyReport] = {}
         self.exports: dict[UUID, ExportRecord] = {}
         self.idempotency: dict[tuple[UUID, str, str], tuple[str, Any]] = {}

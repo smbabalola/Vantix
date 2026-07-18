@@ -10,6 +10,9 @@ TRANSITION_GUARD = Path("backend/alembic/versions/0004_harden_revision_transitio
 CONFIGURATION_LIFECYCLE = Path(
     "backend/alembic/versions/0005_project_configuration_lifecycle.py"
 ).read_text(encoding="utf-8")
+PRODUCTS_PRICING = Path("backend/alembic/versions/0006_project_products_pricing.py").read_text(
+    encoding="utf-8"
+)
 
 
 def test_vtx_auth_004_005_tenant_tables_enable_and_force_rls() -> None:
@@ -72,3 +75,13 @@ def test_vtx_prj_003_same_project_constraint_triggers_are_reversible() -> None:
     assert "daily_report_revisions_snapshot_same_project" in CONFIGURATION_LIFECYCLE
     downgrade = CONFIGURATION_LIFECYCLE.split("def downgrade()", maxsplit=1)[1]
     assert "DROP FUNCTION IF EXISTS vantix_enforce_same_project_ownership()" in downgrade
+
+
+def test_vtx_pro_002_product_price_periods_rls_and_immutability_are_database_guarded() -> None:
+    assert "effective product price periods cannot overlap" in PRODUCTS_PRICING
+    assert "FORCE ROW LEVEL SECURITY" in PRODUCTS_PRICING
+    assert "product configuration is immutable" in PRODUCTS_PRICING
+    downgrade = PRODUCTS_PRICING.split("def downgrade()", maxsplit=1)[1]
+    assert "DROP FUNCTION IF EXISTS vantix_guard_product_price()" in downgrade
+    assert 'op.drop_table("product_price_history")' in downgrade
+    assert 'op.drop_table("project_products")' in downgrade

@@ -130,10 +130,10 @@ constraint triggers so every referenced configuration remains in the same organi
 Project/report/revision snapshot bindings and configuration ownership identities are immutable.
 
 Foundation V1 stores structured draft configuration in `data` and freezes the canonical activated
-form in `project_configuration_snapshots`. Required V1 groups are project identity/units and basic
-interval context. Products, pits, fluid systems, prices, personnel, equipment, screens, losses,
-formation, and directional groups are added only by their later vertical slices; absent groups are
-not fabricated during activation.
+form in `project_configuration_snapshots`. Product/pricing snapshot schema 1.1 composes relational
+project products and prices with project identity/units and basic interval context before validation,
+checksum, and activation. Pits, fluid systems, personnel, equipment, screens, losses, formation, and
+directional groups remain absent until their vertical slices; no group is fabricated.
 
 ### project_intervals
 
@@ -210,15 +210,21 @@ Organisation-level optional master catalogue:
 - item_name
 - alternate_name
 - batch_number
-- unit_size
-- unit_code
+- package_size
+- package_unit_code
 - packaging
 - specific_gravity
 - locator
 - cost_code
-- inventory_item
-- starting_quantity
+- inventory_applicable
+- inventory_unit_code nullable only when not applicable
+- active
 - status
+
+Product code is case-insensitively unique within a configuration version. Package size and optional
+specific gravity are positive decimals. Controlled units and dimensional compatibility are enforced.
+Starting quantity is deliberately absent from this slice because opening stock requires the later
+append-only inventory posting contract.
 
 ### product_price_history
 
@@ -226,15 +232,18 @@ Organisation-level optional master catalogue:
 - project_product_id
 - effective_from
 - effective_to
-- price
+- unit_price
 - currency
-- price_per_unit_code
+- price_basis_unit_code
 - discount_percent
 - taxable
 - source
 - approved_by
 
 No overlapping active price ranges for the same project product and price basis.
+Ranges use `[effective_from, effective_to)` semantics. Product/price rows are mutable only while the
+owning configuration is draft, inherit tenant/project RLS, increment parent configuration version on
+API mutation, and are frozen into the activation snapshot.
 
 ## 6. Personnel, equipment, and screen tables
 

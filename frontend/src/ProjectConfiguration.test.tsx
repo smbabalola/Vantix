@@ -52,6 +52,7 @@ describe("project configuration workspace", () => {
         snapshot_id: null,
         checksum: null,
       }]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => response({
         state: "ready",
         can_activate: true,
@@ -64,6 +65,7 @@ describe("project configuration workspace", () => {
 
     expect(await screen.findByLabelText("Top MD (optional)")).toHaveAttribute("placeholder", "Unavailable");
     expect(screen.getByLabelText(/top md unit/i)).toHaveValue("m");
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     const activate = screen.getByRole("button", { name: /activate and freeze snapshot/i });
     expect(activate).toBeDisabled();
 
@@ -121,6 +123,7 @@ describe("project configuration workspace", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => response(project))
       .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => response({
         state: "ready",
         can_activate: true,
@@ -137,6 +140,7 @@ describe("project configuration workspace", () => {
       }));
 
     render(<ProjectConfiguration projectId={project.id} session={session} />);
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: /validate readiness/i }));
     const activate = screen.getByRole("button", { name: /activate and freeze snapshot/i });
     await waitFor(() => expect(activate).toBeEnabled());
@@ -196,10 +200,12 @@ describe("project configuration workspace", () => {
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => response(project))
       .mockImplementationOnce(() => response([configuration]))
+      .mockImplementationOnce(() => response([]))
       .mockImplementationOnce(() => deferredSave);
 
     render(<ProjectConfiguration projectId={project.id} session={session} />);
     const intervalName = await screen.findByLabelText("Interval name");
+    expect(await screen.findByText("Add at least one active product.")).toBeInTheDocument();
     fireEvent.change(intervalName, { target: { value: "Saved interval" } });
     fireEvent.click(screen.getByRole("button", { name: /save draft/i }));
 

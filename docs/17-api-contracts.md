@@ -197,11 +197,25 @@ Returns status, payload checksum, renderer/template version, binary checksum, an
 
 ### `GET/POST /projects/{project_id}/products`
 
-Configuration-version scoped.
+Configuration-version scoped. POST requires `configuration_version_id` and
+`expected_configuration_version`. It records code/name, packaging, positive package size/content
+unit, explicit inventory applicability/unit, optional SG, and active state. The parent configuration
+row version is returned and incremented.
+
+### `PATCH/DELETE /project-products/{product_id}`
+
+Draft configuration only. Requires `expected_configuration_version`; active/superseded product
+authority is locked. Delete is allowed only before activation and removes draft price children.
 
 ### `POST /project-products/{product_id}/prices`
 
-Validates non-overlapping effective range and unit basis.
+Requires the parent expected configuration version. Validates project currency, non-negative decimal
+price, compatible basis unit, and non-overlapping `[effective_from, effective_to)` range.
+
+### `PATCH/DELETE /product-prices/{price_id}`
+
+Draft configuration only with parent optimistic concurrency. Corrections after activation require a
+new configuration version; historical snapshots are never edited.
 
 ### `GET /project-products/{product_id}/price-at?date=YYYY-MM-DD`
 

@@ -19,6 +19,7 @@ from app.models import (
     DailyReport,
     DailyReportRevision,
     Project,
+    ProjectProduct,
     ReportPayload,
 )
 from app.postgres_repository import PostgresFoundationRepository
@@ -30,7 +31,9 @@ from app.schemas import (
     DraftPatch,
     ExportRequest,
     OrganisationCreate,
+    ProductPriceCreate,
     ProjectCreate,
+    ProjectProductCreate,
 )
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -76,6 +79,36 @@ def activate_configuration(
     version_id: UUID,
     key: str,
 ):
+    products = repository.list_products(auth, project_id, version_id)
+    if not products:
+        configuration = repository.get_configuration(auth, project_id, version_id)
+        product = repository.create_product(
+            auth,
+            project_id,
+            ProjectProductCreate(
+                configuration_version_id=version_id,
+                expected_configuration_version=configuration.row_version,
+                item_code="BAR-001",
+                item_name="Barite",
+                packaging="sack",
+                package_size="25",
+                package_unit_code="kg",
+                inventory_applicable=True,
+                inventory_unit_code="package",
+                specific_gravity="4.2",
+            ),
+        )
+        repository.create_product_price(
+            auth,
+            product.id,
+            ProductPriceCreate(
+                expected_configuration_version=product.configuration_row_version,
+                effective_from="2026-01-01",
+                unit_price="18.50",
+                currency="GBP",
+                price_basis_unit_code="package",
+            ),
+        )
     readiness = repository.validate_configuration(auth, project_id, version_id)
     assert readiness.can_activate is True
     return repository.activate_configuration(
@@ -229,6 +262,7 @@ def test_vtx_prj_002_readiness_blocks_activation_atomically() -> None:
     readiness = repository.validate_configuration(auth, project.id, configuration.id)
     assert readiness.can_activate is False
     assert {issue["code"] for issue in readiness.issues} == {
+        "ACTIVE_PRODUCT_REQUIRED",
         "DEFAULT_INTERVAL_REQUIRED",
         "INTERVAL_REQUIRED",
     }
@@ -490,6 +524,159 @@ def test_vtx_prj_006_configuration_reads_are_tenant_isolated() -> None:
     with pytest.raises(HTTPException) as error:
         repository.list_configurations(outsider, project.id)
     assert error.value.status_code == 404
+
+
+def test_vtx_pro_001_002_products_prices_are_ready_frozen_and_database_guarded() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    product = repository.create_product(
+        auth,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=configuration.row_version,
+            item_code="BAR-001",
+            item_name="Barite",
+            packaging="sack",
+            package_size="25",
+            package_unit_code="kg",
+            inventory_applicable=True,
+            inventory_unit_code="package",
+            specific_gravity="4.2",
+        ),
+    )
+    incomplete = repository.validate_configuration(auth, project.id, configuration.id)
+    assert incomplete.can_activate is False
+    assert {issue["code"] for issue in incomplete.issues} == {"ACTIVE_PRODUCT_PRICE_REQUIRED"}
+
+    with_price = repository.create_product_price(
+        auth,
+        product.id,
+        ProductPriceCreate(
+            expected_configuration_version=product.configuration_row_version,
+            effective_from="2026-01-01",
+            effective_to="2026-07-01",
+            unit_price="18.5",
+            currency="GBP",
+            price_basis_unit_code="package",
+        ),
+    )
+    engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO product_price_history "
+                "(id, organisation_id, project_id, project_product_id, effective_from, "
+                "effective_to, unit_price, currency, price_basis_unit_code) VALUES "
+                "(:id, :org, :project, :product, '2026-06-30', NULL, 19, 'GBP', 'package')"
+            ),
+            {
+                "id": uuid4(),
+                "org": auth.organisation_id,
+                "project": project.id,
+                "product": product.id,
+            },
+        )
+
+    active = activate_configuration(repository, auth, project.id, configuration.id, "products")
+    with engine.connect() as connection:
+        snapshot = connection.scalar(
+            select(ConfigurationSnapshot.snapshot_json).where(
+                ConfigurationSnapshot.id == active.snapshot_id
+            )
+        )
+    assert snapshot["products"][0]["specific_gravity"] == "4.2"
+    assert snapshot["products"][0]["prices"][0]["unit_price"] == "18.5"
+
+    with pytest.raises(DBAPIError), engine.begin() as connection:
+        connection.execute(
+            update(ProjectProduct)
+            .where(ProjectProduct.id == product.id)
+            .values(item_name="Mutated after activation")
+        )
+    engine.dispose()
+    assert with_price.configuration_row_version == 3
+
+
+def test_vtx_auth_004_005_product_rows_require_tenant_and_project_authority() -> None:
+    repository = PostgresFoundationRepository()
+    owner = context()
+    project = prepare_project(repository, owner)
+    configuration = create_configuration(repository, owner, project.id, valid_configuration())
+    product = repository.create_product(
+        owner,
+        project.id,
+        ProjectProductCreate(
+            configuration_version_id=configuration.id,
+            expected_configuration_version=configuration.row_version,
+            item_code="SEC-001",
+            item_name="Secured product",
+            packaging="drum",
+            package_size="200",
+            package_unit_code="L",
+            inventory_applicable=True,
+            inventory_unit_code="L",
+        ),
+    )
+    nonmember = context(organisation_id=owner.organisation_id)
+    admin_engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with admin_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, external_subject, status) VALUES (:id, :subject, 'active')"
+            ),
+            {"id": nonmember.user_id, "subject": f"test:{nonmember.user_id}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO organisation_memberships "
+                "(organisation_id, user_id, role, status) "
+                "VALUES (:org, :user, 'auditor', 'active')"
+            ),
+            {"org": owner.organisation_id, "user": nonmember.user_id},
+        )
+    admin_engine.dispose()
+
+    app_engine = create_engine(os.environ["VANTIX_DATABASE_URL"])
+
+    def set_context(connection) -> None:
+        connection.execute(
+            text(
+                "SELECT set_config('app.current_user_id', :user, true), "
+                "set_config('app.current_org_id', :org, true), "
+                "set_config('app.current_project_ids', :projects, true), "
+                "set_config('app.is_system_service', 'false', true)"
+            ),
+            {
+                "user": str(nonmember.user_id),
+                "org": str(owner.organisation_id),
+                "projects": str(project.id),
+            },
+        )
+
+    with app_engine.begin() as connection:
+        set_context(connection)
+        assert connection.scalar(text("SELECT count(*) FROM project_products")) == 0
+
+    with pytest.raises(DBAPIError), app_engine.begin() as connection:
+        set_context(connection)
+        connection.execute(
+            text(
+                "INSERT INTO product_price_history "
+                "(id, organisation_id, project_id, project_product_id, effective_from, "
+                "unit_price, currency, price_basis_unit_code) VALUES "
+                "(:id, :org, :project, :product, '2026-01-01', 1, 'GBP', 'package')"
+            ),
+            {
+                "id": uuid4(),
+                "org": owner.organisation_id,
+                "project": project.id,
+                "product": product.id,
+            },
+        )
+    app_engine.dispose()
 
 
 def test_vtx_prj_001_organisation_admin_can_manage_all_organisation_projects() -> None:
@@ -1148,7 +1335,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0005_project_config_lifecycle"
+            "0006_project_products_pricing"
         )
         flags = connection.execute(
             text(
@@ -1234,6 +1421,8 @@ def test_vtx_mvp_001_clean_migration_upgrade_downgrade_cycle() -> None:
                        WHERE proname IN (
                          'vantix_guard_revision_mutation',
                          'vantix_guard_configuration_mutation',
+                         'vantix_guard_product_configuration',
+                         'vantix_guard_product_price',
                          'vantix_enforce_same_project_ownership',
                          'vantix_guard_snapshot_binding',
                          'vantix_reject_mutation'

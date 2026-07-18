@@ -8,14 +8,20 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 from vantix_core.canonical import payload_checksum
+from vantix_core.products import (
+    ProductValidationError,
+    canonicalise_product,
+    select_effective_price,
+)
 from vantix_core.project_configuration import (
     ConfigurationActivationError,
     build_project_snapshot,
@@ -35,8 +41,10 @@ from .models import (
     IdempotencyRecord,
     Organisation,
     OrganisationMembership,
+    ProductPrice,
     Project,
     ProjectMembership,
+    ProjectProduct,
     ReportDecision,
     ReportExport,
     ReportPayload,
@@ -45,8 +53,10 @@ from .models import (
 from .renderers import filter_payload_visibility, render_report
 from .schemas import (
     ConfigurationCreate,
+    ConfigurationMutationView,
     ConfigurationPatch,
     ConfigurationReadinessView,
+    ConfigurationVersionExpectation,
     ConfigurationView,
     DailyReportCreate,
     DecisionRequest,
@@ -55,7 +65,13 @@ from .schemas import (
     ExportView,
     OrganisationCreate,
     OrganisationView,
+    ProductPriceCreate,
+    ProductPricePatch,
+    ProductPriceView,
     ProjectCreate,
+    ProjectProductCreate,
+    ProjectProductPatch,
+    ProjectProductView,
     ProjectView,
     ReadinessView,
     ReportView,
@@ -283,6 +299,78 @@ class PostgresFoundationRepository:
         )
 
     @staticmethod
+    def _decimal_string(value: Decimal) -> str:
+        return "0" if value == 0 else format(value.normalize(), "f")
+
+    @classmethod
+    def _price_view(cls, price: ProductPrice) -> ProductPriceView:
+        return ProductPriceView(
+            id=price.id,
+            project_product_id=price.project_product_id,
+            effective_from=price.effective_from,
+            effective_to=price.effective_to,
+            unit_price=cls._decimal_string(price.unit_price),
+            currency=price.currency,
+            price_basis_unit_code=cast(Any, price.price_basis_unit_code),
+            source=price.source,
+        )
+
+    @classmethod
+    def _product_view(
+        cls, session: Session, product: ProjectProduct, configuration_row_version: int
+    ) -> ProjectProductView:
+        prices = session.scalars(
+            select(ProductPrice)
+            .where(ProductPrice.project_product_id == product.id)
+            .order_by(ProductPrice.effective_from, ProductPrice.id)
+        ).all()
+        return ProjectProductView(
+            id=product.id,
+            project_id=product.project_id,
+            configuration_version_id=product.configuration_version_id,
+            configuration_row_version=configuration_row_version,
+            item_code=product.item_code,
+            item_name=product.item_name,
+            alternate_name=product.alternate_name,
+            packaging=cast(Any, product.packaging),
+            package_size=cls._decimal_string(product.package_size),
+            package_unit_code=cast(Any, product.package_unit_code),
+            inventory_applicable=product.inventory_applicable,
+            inventory_unit_code=cast(Any, product.inventory_unit_code),
+            specific_gravity=(
+                cls._decimal_string(product.specific_gravity)
+                if product.specific_gravity is not None
+                else None
+            ),
+            active=product.active,
+            prices=[cls._price_view(price) for price in prices],
+        )
+
+    @classmethod
+    def _configuration_payload(
+        cls, session: Session, configuration: ConfigurationVersion
+    ) -> dict[str, Any]:
+        products = session.scalars(
+            select(ProjectProduct)
+            .where(ProjectProduct.configuration_version_id == configuration.id)
+            .order_by(ProjectProduct.item_code, ProjectProduct.id)
+        ).all()
+        payload = deepcopy(configuration.data)
+        payload["products"] = [
+            cls._product_view(session, product, configuration.row_version).model_dump(
+                mode="json",
+                exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+                exclude_none=True,
+            )
+            for product in products
+        ]
+        return payload
+
+    @staticmethod
+    def _product_error(exc: ProductValidationError) -> HTTPException:
+        return _error(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.code, str(exc))
+
+    @staticmethod
     def _lock_idempotency(
         session: Session,
         auth: AuthContext,
@@ -487,6 +575,51 @@ class PostgresFoundationRepository:
             )
             session.add(configuration)
             session.flush()
+            if body.data is None and body.copy_active and active is not None:
+                active_products = session.scalars(
+                    select(ProjectProduct).where(
+                        ProjectProduct.configuration_version_id == active.id
+                    )
+                ).all()
+                for source_product in active_products:
+                    copied_product = ProjectProduct(
+                        id=uuid4(),
+                        organisation_id=auth.organisation_id,
+                        project_id=project_id,
+                        configuration_version_id=configuration.id,
+                        item_code=source_product.item_code,
+                        item_name=source_product.item_name,
+                        alternate_name=source_product.alternate_name,
+                        packaging=source_product.packaging,
+                        package_size=source_product.package_size,
+                        package_unit_code=source_product.package_unit_code,
+                        inventory_applicable=source_product.inventory_applicable,
+                        inventory_unit_code=source_product.inventory_unit_code,
+                        specific_gravity=source_product.specific_gravity,
+                        active=source_product.active,
+                    )
+                    session.add(copied_product)
+                    session.flush()
+                    source_prices = session.scalars(
+                        select(ProductPrice).where(
+                            ProductPrice.project_product_id == source_product.id
+                        )
+                    ).all()
+                    for source_price in source_prices:
+                        session.add(
+                            ProductPrice(
+                                id=uuid4(),
+                                organisation_id=auth.organisation_id,
+                                project_id=project_id,
+                                project_product_id=copied_product.id,
+                                effective_from=source_price.effective_from,
+                                effective_to=source_price.effective_to,
+                                unit_price=source_price.unit_price,
+                                currency=source_price.currency,
+                                price_basis_unit_code=source_price.price_basis_unit_code,
+                                source=source_price.source,
+                            )
+                        )
             self._audit(
                 session,
                 auth,
@@ -582,6 +715,411 @@ class PostgresFoundationRepository:
             )
             return self._configuration_view(session, configuration)
 
+    def _lock_product_configuration(
+        self,
+        session: Session,
+        auth: AuthContext,
+        project_id: UUID,
+        configuration_version_id: UUID,
+        expected_version: int,
+    ) -> tuple[Project, ConfigurationVersion]:
+        project = self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+        configuration = session.scalar(
+            select(ConfigurationVersion)
+            .where(
+                ConfigurationVersion.id == configuration_version_id,
+                ConfigurationVersion.project_id == project_id,
+            )
+            .with_for_update()
+        )
+        if configuration is None:
+            raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+        if configuration.state != "draft":
+            raise _error(status.HTTP_423_LOCKED, "CONFIGURATION_LOCKED")
+        if configuration.row_version != expected_version:
+            raise _error(status.HTTP_412_PRECONDITION_FAILED, "CONFIGURATION_VERSION_CONFLICT")
+        return project, configuration
+
+    def list_products(
+        self, auth: AuthContext, project_id: UUID, configuration_version_id: UUID
+    ) -> list[ProjectProductView]:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            self._project(session, auth, project_id, Capability.CONFIGURE_PROJECT)
+            configuration = session.scalar(
+                select(ConfigurationVersion).where(
+                    ConfigurationVersion.id == configuration_version_id,
+                    ConfigurationVersion.project_id == project_id,
+                )
+            )
+            if configuration is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+            products = session.scalars(
+                select(ProjectProduct)
+                .where(ProjectProduct.configuration_version_id == configuration.id)
+                .order_by(ProjectProduct.item_code, ProjectProduct.id)
+            ).all()
+            return [
+                self._product_view(session, product, configuration.row_version)
+                for product in products
+            ]
+
+    def create_product(
+        self, auth: AuthContext, project_id: UUID, body: ProjectProductCreate
+    ) -> ProjectProductView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                project_id,
+                body.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            product_id = uuid4()
+            values = body.model_dump(
+                mode="json",
+                exclude={"configuration_version_id", "expected_configuration_version"},
+                exclude_none=True,
+            )
+            try:
+                canonical = canonicalise_product(
+                    {"id": str(product_id), **values, "prices": []},
+                    project.currency,
+                    require_price=False,
+                )
+            except ProductValidationError as exc:
+                raise self._product_error(exc) from exc
+            duplicate = session.scalar(
+                select(ProjectProduct.id).where(
+                    ProjectProduct.configuration_version_id == configuration.id,
+                    func.lower(ProjectProduct.item_code) == canonical["item_code"].lower(),
+                )
+            )
+            if duplicate is not None:
+                raise _error(status.HTTP_409_CONFLICT, "PRODUCT_CODE_EXISTS")
+            product = ProjectProduct(
+                id=product_id,
+                organisation_id=auth.organisation_id,
+                project_id=project_id,
+                configuration_version_id=configuration.id,
+                item_code=canonical["item_code"],
+                item_name=canonical["item_name"],
+                alternate_name=canonical.get("alternate_name"),
+                packaging=canonical["packaging"],
+                package_size=Decimal(canonical["package_size"]),
+                package_unit_code=canonical["package_unit_code"],
+                inventory_applicable=canonical["inventory_applicable"],
+                inventory_unit_code=canonical.get("inventory_unit_code"),
+                specific_gravity=(
+                    Decimal(canonical["specific_gravity"])
+                    if canonical.get("specific_gravity") is not None
+                    else None
+                ),
+                active=canonical.get("active", True),
+            )
+            session.add(product)
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=project_id,
+                entity_type="project_product",
+                entity_id=product.id,
+                action="create",
+                before=None,
+                after=canonical,
+            )
+            return self._product_view(session, product, configuration.row_version)
+
+    def patch_product(
+        self, auth: AuthContext, product_id: UUID, body: ProjectProductPatch
+    ) -> ProjectProductView:
+        with self._transaction(auth, require_membership=True) as session:
+            product = session.scalar(select(ProjectProduct).where(ProjectProduct.id == product_id))
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            project, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                product.project_id,
+                product.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            before = self._product_view(session, product, configuration.row_version).model_dump(
+                mode="json"
+            )
+            values = body.model_dump(
+                mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+            )
+            try:
+                canonical = canonicalise_product(
+                    {"id": str(product.id), **values, "prices": before["prices"]},
+                    project.currency,
+                    require_price=False,
+                )
+            except ProductValidationError as exc:
+                raise self._product_error(exc) from exc
+            duplicate = session.scalar(
+                select(ProjectProduct.id).where(
+                    ProjectProduct.configuration_version_id == configuration.id,
+                    ProjectProduct.id != product.id,
+                    func.lower(ProjectProduct.item_code) == canonical["item_code"].lower(),
+                )
+            )
+            if duplicate is not None:
+                raise _error(status.HTTP_409_CONFLICT, "PRODUCT_CODE_EXISTS")
+            for field in (
+                "item_code",
+                "item_name",
+                "alternate_name",
+                "packaging",
+                "package_unit_code",
+                "inventory_applicable",
+                "inventory_unit_code",
+                "active",
+            ):
+                setattr(product, field, canonical.get(field))
+            product.package_size = Decimal(canonical["package_size"])
+            product.specific_gravity = (
+                Decimal(canonical["specific_gravity"])
+                if canonical.get("specific_gravity") is not None
+                else None
+            )
+            configuration.row_version += 1
+            session.flush()
+            after = self._product_view(session, product, configuration.row_version)
+            self._audit(
+                session,
+                auth,
+                project_id=product.project_id,
+                entity_type="project_product",
+                entity_id=product.id,
+                action="update",
+                before=before,
+                after=after.model_dump(mode="json"),
+            )
+            return after
+
+    def delete_product(
+        self, auth: AuthContext, product_id: UUID, body: ConfigurationVersionExpectation
+    ) -> ConfigurationMutationView:
+        with self._transaction(auth, require_membership=True) as session:
+            product = session.scalar(select(ProjectProduct).where(ProjectProduct.id == product_id))
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            _, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                product.project_id,
+                product.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            before = self._product_view(session, product, configuration.row_version).model_dump(
+                mode="json"
+            )
+            session.delete(product)
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=product.project_id,
+                entity_type="project_product",
+                entity_id=product.id,
+                action="delete_draft",
+                before=before,
+                after=None,
+            )
+            return ConfigurationMutationView(configuration_row_version=configuration.row_version)
+
+    def create_product_price(
+        self, auth: AuthContext, product_id: UUID, body: ProductPriceCreate
+    ) -> ProjectProductView:
+        with self._transaction(auth, require_membership=True) as session:
+            product = session.scalar(select(ProjectProduct).where(ProjectProduct.id == product_id))
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            project, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                product.project_id,
+                product.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            product_view = self._product_view(session, product, configuration.row_version)
+            price_id = uuid4()
+            candidate_price = {
+                "id": str(price_id),
+                **body.model_dump(
+                    mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+                ),
+            }
+            candidate = product_view.model_dump(
+                mode="json",
+                exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+                exclude_none=True,
+            )
+            candidate["prices"] = [*candidate["prices"], candidate_price]
+            try:
+                canonical = canonicalise_product(candidate, project.currency, require_price=False)
+            except ProductValidationError as exc:
+                raise self._product_error(exc) from exc
+            canonical_price = next(
+                item for item in canonical["prices"] if item["id"] == str(price_id)
+            )
+            price = ProductPrice(
+                id=price_id,
+                organisation_id=auth.organisation_id,
+                project_id=product.project_id,
+                project_product_id=product.id,
+                effective_from=date.fromisoformat(canonical_price["effective_from"]),
+                effective_to=(
+                    date.fromisoformat(canonical_price["effective_to"])
+                    if canonical_price.get("effective_to") is not None
+                    else None
+                ),
+                unit_price=Decimal(canonical_price["unit_price"]),
+                currency=canonical_price["currency"],
+                price_basis_unit_code=canonical_price["price_basis_unit_code"],
+                source=canonical_price.get("source"),
+            )
+            session.add(price)
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=product.project_id,
+                entity_type="product_price",
+                entity_id=price.id,
+                action="create",
+                before=None,
+                after=canonical_price,
+            )
+            return self._product_view(session, product, configuration.row_version)
+
+    def patch_product_price(
+        self, auth: AuthContext, price_id: UUID, body: ProductPricePatch
+    ) -> ProjectProductView:
+        with self._transaction(auth, require_membership=True) as session:
+            price = session.scalar(select(ProductPrice).where(ProductPrice.id == price_id))
+            if price is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PRODUCT_PRICE_NOT_FOUND")
+            product = session.scalar(
+                select(ProjectProduct).where(ProjectProduct.id == price.project_product_id)
+            )
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            project, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                product.project_id,
+                product.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            product_view = self._product_view(session, product, configuration.row_version)
+            before = self._price_view(price).model_dump(mode="json")
+            replacement = {
+                "id": str(price.id),
+                **body.model_dump(
+                    mode="json", exclude={"expected_configuration_version"}, exclude_none=True
+                ),
+            }
+            candidate = product_view.model_dump(
+                mode="json",
+                exclude={"project_id", "configuration_version_id", "configuration_row_version"},
+                exclude_none=True,
+            )
+            candidate["prices"] = [
+                replacement if item["id"] == str(price.id) else item for item in candidate["prices"]
+            ]
+            try:
+                canonical = canonicalise_product(candidate, project.currency, require_price=False)
+            except ProductValidationError as exc:
+                raise self._product_error(exc) from exc
+            canonical_price = next(
+                item for item in canonical["prices"] if item["id"] == str(price.id)
+            )
+            price.effective_from = date.fromisoformat(canonical_price["effective_from"])
+            price.effective_to = (
+                date.fromisoformat(canonical_price["effective_to"])
+                if canonical_price.get("effective_to") is not None
+                else None
+            )
+            price.unit_price = Decimal(canonical_price["unit_price"])
+            price.currency = canonical_price["currency"]
+            price.price_basis_unit_code = canonical_price["price_basis_unit_code"]
+            price.source = canonical_price.get("source")
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=product.project_id,
+                entity_type="product_price",
+                entity_id=price.id,
+                action="update",
+                before=before,
+                after=canonical_price,
+            )
+            return self._product_view(session, product, configuration.row_version)
+
+    def delete_product_price(
+        self, auth: AuthContext, price_id: UUID, body: ConfigurationVersionExpectation
+    ) -> ProjectProductView:
+        with self._transaction(auth, require_membership=True) as session:
+            price = session.scalar(select(ProductPrice).where(ProductPrice.id == price_id))
+            if price is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PRODUCT_PRICE_NOT_FOUND")
+            product = session.scalar(
+                select(ProjectProduct).where(ProjectProduct.id == price.project_product_id)
+            )
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            _, configuration = self._lock_product_configuration(
+                session,
+                auth,
+                product.project_id,
+                product.configuration_version_id,
+                body.expected_configuration_version,
+            )
+            before = self._price_view(price).model_dump(mode="json")
+            session.delete(price)
+            configuration.row_version += 1
+            session.flush()
+            self._audit(
+                session,
+                auth,
+                project_id=product.project_id,
+                entity_type="product_price",
+                entity_id=price.id,
+                action="delete_draft",
+                before=before,
+                after=None,
+            )
+            return self._product_view(session, product, configuration.row_version)
+
+    def price_at(
+        self, auth: AuthContext, product_id: UUID, effective_date: date
+    ) -> ProductPriceView:
+        with self._transaction(auth, require_membership=True) as session:
+            product = session.scalar(select(ProjectProduct).where(ProjectProduct.id == product_id))
+            if product is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_PRODUCT_NOT_FOUND")
+            self._project(session, auth, product.project_id, Capability.CONFIGURE_PROJECT)
+            prices = session.scalars(
+                select(ProductPrice)
+                .where(ProductPrice.project_product_id == product.id)
+                .order_by(ProductPrice.effective_from)
+            ).all()
+            selected = select_effective_price(
+                [self._price_view(price).model_dump(mode="json") for price in prices],
+                effective_date,
+            )
+            if selected is None:
+                raise _error(status.HTTP_404_NOT_FOUND, "PRICE_NOT_EFFECTIVE")
+            return ProductPriceView.model_validate(selected)
+
     def validate_configuration(
         self, auth: AuthContext, project_id: UUID, version_id: UUID
     ) -> ConfigurationReadinessView:
@@ -595,14 +1133,15 @@ class PostgresFoundationRepository:
             )
             if configuration is None:
                 raise _error(status.HTTP_404_NOT_FOUND, "CONFIGURATION_NOT_FOUND")
+            payload = self._configuration_payload(session, configuration)
             readiness = validate_project_configuration(
-                self._project_configuration_data(project), configuration.data
+                self._project_configuration_data(project), payload
             )
             return ConfigurationReadinessView(
                 state=readiness.state,
                 can_activate=readiness.can_activate,
                 validated_version=configuration.row_version,
-                draft_checksum=payload_checksum(configuration.data),
+                draft_checksum=payload_checksum(payload),
                 issues=[asdict(issue) for issue in readiness.issues],
             )
 
@@ -658,10 +1197,11 @@ class PostgresFoundationRepository:
                 if project.current_configuration_version_id
                 else None
             )
+            payload = self._configuration_payload(session, configuration)
             try:
                 guard_configuration_activation(
                     project=self._project_configuration_data(project),
-                    data=configuration.data,
+                    data=payload,
                     state=configuration.state,
                     row_version=configuration.row_version,
                     expected_version=expected_version,
@@ -690,7 +1230,7 @@ class PostgresFoundationRepository:
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
                 project=self._project_configuration_data(project),
-                data=configuration.data,
+                data=payload,
                 version_id=configuration.id,
                 version_number=configuration.version_number,
                 activated_by=auth.user_id,
@@ -701,7 +1241,7 @@ class PostgresFoundationRepository:
                 organisation_id=auth.organisation_id,
                 project_id=project_id,
                 configuration_version_id=configuration.id,
-                schema_version="1.0",
+                schema_version="1.1",
                 snapshot_json=snapshot_json,
                 canonical_checksum=checksum,
             )
