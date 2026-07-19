@@ -154,11 +154,16 @@ export interface InventoryLedgerLine {
   product_definition_id: string;
   configuration_product_version_id: string;
   product_price_version_id: string | null;
+  reversal_of_line_id: string | null;
+  batch_number: string | null;
+  manufacture_date: string | null;
+  expiry_date: string | null;
   entered_quantity: string;
   entered_unit_code: ProductUnitCode;
   canonical_signed_quantity: string;
   canonical_unit_code: "kg" | "L" | "each";
   price_status: "ready" | "unavailable";
+  cost_source: "supplier_document" | "configured_effective_price" | "unavailable";
   applied_unit_price: string | null;
   price_basis_unit_code: ProductUnitCode | null;
   price_effective_from: string | null;
@@ -203,14 +208,68 @@ export interface InventoryPosting {
   id: string;
   project_id: string;
   source_configuration_snapshot_id: string;
-  posting_type: "opening_stock" | "reversal";
+  posting_type: "opening_stock" | "receipt" | "reversal";
   status: "posted";
   posting_date: string;
   reversal_of_posting_id: string | null;
   reversal_posting_id: string | null;
   reason: string | null;
+  supplier_name: string | null;
+  delivery_note_number: string | null;
+  purchase_order_reference: string | null;
+  invoice_reference: string | null;
+  received_by_user_id: string | null;
   posted_by: string;
   posted_at: string;
   lines: InventoryLedgerLine[];
+}
+
+export interface ReceiptAuthority extends OpeningStockAuthority {
+  project_currency: string;
+}
+
+export interface ReceiptSupplierPriceInput {
+  unit_price: string;
+  price_basis_unit_code: ProductUnitCode;
+  currency: string;
+}
+
+export interface ReceiptLineInput {
+  product_definition_id: string;
+  entered_quantity: string;
+  entered_unit_code: ProductUnitCode;
+  batch_number?: string;
+  manufacture_date?: string;
+  expiry_date?: string;
+  supplier_price?: ReceiptSupplierPriceInput;
+}
+
+export interface ReceiptInput {
+  expected_configuration_snapshot_id: string;
+  posting_date: string;
+  supplier_name: string;
+  delivery_note_number: string;
+  purchase_order_reference?: string;
+  invoice_reference?: string;
+  lines: ReceiptLineInput[];
+}
+
+export interface ReceiptPreviewLine extends OpeningStockPreviewLine {
+  batch_number: string | null;
+  manufacture_date: string | null;
+  expiry_date: string | null;
+  cost_source: "supplier_document" | "configured_effective_price" | "unavailable";
+}
+
+export interface ReceiptPreview {
+  project_id: string;
+  posting_date: string;
+  configuration_snapshot_id: string;
+  supplier_name: string;
+  delivery_note_number: string;
+  purchase_order_reference: string | null;
+  invoice_reference: string | null;
+  lines: ReceiptPreviewLine[];
+  currencies: Record<string, string>;
 }
 

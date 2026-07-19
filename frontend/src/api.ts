@@ -7,6 +7,9 @@ import type {
   Project,
   ProjectConfiguration,
   ProjectProduct,
+  ReceiptAuthority,
+  ReceiptInput,
+  ReceiptPreview,
   ProductPrice,
   Readiness,
   Report,
@@ -248,6 +251,38 @@ export const api = {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ posting_date: postingDate, reason }),
+    });
+  },
+  receiptAuthority(
+    session: Session,
+    projectId: string,
+    postingDate: string,
+  ): Promise<ReceiptAuthority> {
+    return request(
+      session,
+      `/projects/${projectId}/inventory/receipt-authority?posting_date=${postingDate}`,
+    );
+  },
+  previewReceipt(
+    session: Session,
+    projectId: string,
+    receipt: ReceiptInput,
+  ): Promise<ReceiptPreview> {
+    return request(session, `/projects/${projectId}/inventory-postings/receipts/preview`, {
+      method: "POST",
+      body: JSON.stringify(receipt),
+    });
+  },
+  postReceipt(
+    session: Session,
+    projectId: string,
+    receipt: ReceiptInput,
+    idempotencyKey: string,
+  ): Promise<InventoryPosting> {
+    return request(session, `/projects/${projectId}/inventory-postings/receipts`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(receipt),
     });
   },
   getReport(session: Session, reportId: string): Promise<Report> {

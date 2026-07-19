@@ -37,7 +37,6 @@ The project-products/pricing slice adds:
 - optimistic concurrency, audit, RLS, and database immutability for product authority
 - configuration readiness/checksum and immutable snapshot inclusion
 - a responsive product/pricing grid with deliberate effective dates, field errors, and unsaved-work gating
-- no inventory posting or balance behaviour
 
 The inventory-ledger/opening-stock slice adds:
 
@@ -47,6 +46,19 @@ The inventory-ledger/opening-stock slice adds:
 - honest unavailable-price postings whose monetary fields remain null rather than zero
 - idempotent posting, exact immutable reversals, audit events, and tenant/project RLS
 - a practical opening-stock workspace with explicit units and immutable posting history
+
+The supplier-receipts slice adds:
+
+- immutable receipt headers with normalized supplier and delivery-note identity
+- stable product lineage, frozen configuration-product/package context, and optional batch dates
+- supplier-document price precedence with configured-price fallback and explicit unavailable cost
+- server-authoritative canonical conversion, currency rounding, preview, and posting
+- project/supplier delivery-note uniqueness, idempotency, audit, RLS, and exact line-linked reversals
+- migration `0009_inventory_receipts`, preserving every previously merged migration unchanged
+- a four-stage receipt workspace with frozen preview, cost-source visibility, and receipt history
+
+Transfers, consumption, adjustments, physical counts, reconciliation, purchase-order workflow,
+accounts-payable matching, inter-project movement, and inventory valuation remain outside this slice.
 
 PostgreSQL is the default runtime repository. The in-memory adapter remains only as an explicit
 test dependency override. Submission readiness, version checking, state transition, frozen

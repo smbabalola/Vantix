@@ -4,6 +4,7 @@ import App from "./App";
 import { ApiError, api, type Session } from "./api";
 import ProjectConfiguration from "./ProjectConfiguration";
 import OpeningStockWorkspace from "./OpeningStockWorkspace";
+import ReceiptWorkspace from "./ReceiptWorkspace";
 import type { Report } from "./types";
 
 function environmentSession(): Session | undefined {
@@ -40,6 +41,9 @@ export default function Bootstrap() {
   }
   if (session && projectId && workspace === "opening-stock") {
     return <OpeningStockWorkspace projectId={projectId} session={session} />;
+  }
+  if (session && projectId && workspace === "receipts") {
+    return <ReceiptWorkspace projectId={projectId} session={session} />;
   }
   if (session && projectId) return <ProjectConfiguration projectId={projectId} session={session} />;
   return <App initialReport={report} session={session} />;

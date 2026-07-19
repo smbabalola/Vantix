@@ -120,6 +120,11 @@ select { min-height: 44px; padding: 9px 10px; border: 1px solid #cbd7d5; border-
 .inventory-history-card small { color: var(--muted); overflow-wrap: anywhere; }
 .history-line { display: grid; gap: 4px; margin-top: 5px; padding: 10px; border-left: 3px solid var(--teal); background: #f8faf9; font-size: 13px; }
 .inventory-history article span:not(.state-badge) { color: var(--muted); font-size: 13px; }
+.receipt-line { display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 12px; margin: 14px 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf9; }
+.receipt-line legend { padding: 0 8px; color: var(--ink); font-size: 13px; }
+.receipt-workspace > .panel { margin-top: 20px; }
+.receipt-workspace details.inventory-history-card { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.receipt-workspace details summary { cursor: pointer; }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 86px 1fr; }
@@ -130,6 +135,7 @@ select { min-height: 44px; padding: 9px 10px; border: 1px solid #cbd7d5; border-
   .content-grid { grid-template-columns: 1fr; }
   .context-strip { grid-template-columns: 1fr 1fr; }
   .product-grid-header, .product-grid-row { min-width: 860px; }
+  .receipt-line { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
 }
 
 @media (max-width: 640px) {
@@ -141,5 +147,6 @@ select { min-height: 44px; padding: 9px 10px; border: 1px solid #cbd7d5; border-
   .workspace-header { display: grid; }
   .form-grid, .context-strip { grid-template-columns: 1fr; }
   .decision-bar { align-items: stretch; flex-direction: column; }
+  .receipt-line { grid-template-columns: 1fr; }
 }
 
