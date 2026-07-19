@@ -13,6 +13,7 @@
 - [x] Verify receipt reversal flow: reversal posted with exact negated frozen values (−1,000 kg, GBP −770.00), receipt/reversal cross-linked, UI hides the reversal panel for already-reversed receipts
 - [x] Frontend test suite green: 6 files, 16 tests passed (vitest)
 - [x] Backend test suite green on main: 56 passed, 2 Windows-only skips (pytest)
+- [x] Session wrap-up: dev servers stopped (API 8010, Vite 5174); postgres/minio containers left running with seeded dev data
 
 ## In progress / known issues
 
