@@ -10,6 +10,7 @@
 - [x] Verify local dev stack end to end: migrations at head, API on 8010, seeded dev org/user, project creation flow, full test suite green (56 passed, 2 Windows-only skips)
 - [x] Verify receipt workspace in browser: Vite dev server on 5174 (5173 occupied) proxying to API on 8010, seeded VTX-001 configuration snapshot with BAR-001, receipt previewed and posted (40 pkg → 1,000 kg, GBP 770.00), UI renders history and reversal panel
 - [x] Make Vite dev proxy target overridable via `VANTIX_API_PROXY` env var (`d43f2a8`, pushed)
+- [x] Verify receipt reversal flow: reversal posted with exact negated frozen values (−1,000 kg, GBP −770.00), receipt/reversal cross-linked, UI hides the reversal panel for already-reversed receipts
 
 ## In progress / known issues
 
