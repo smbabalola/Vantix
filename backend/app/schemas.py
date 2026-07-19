@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class OrganisationCreate(BaseModel):
@@ -224,6 +224,69 @@ class OpeningStockPreviewView(BaseModel):
     currencies: dict[str, str]
 
 
+class ReceiptSupplierPrice(BaseModel):
+    unit_price: str
+    price_basis_unit_code: ProductUnitCode
+    currency: str = Field(min_length=3, max_length=3)
+
+
+class ReceiptLineCreate(BaseModel):
+    product_definition_id: UUID
+    entered_quantity: str
+    entered_unit_code: ProductUnitCode
+    batch_number: str | None = Field(default=None, max_length=100)
+    manufacture_date: date | None = None
+    expiry_date: date | None = None
+    supplier_price: ReceiptSupplierPrice | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> ReceiptLineCreate:
+        if (
+            self.manufacture_date is not None
+            and self.expiry_date is not None
+            and self.expiry_date <= self.manufacture_date
+        ):
+            raise ValueError("expiry_date must be later than manufacture_date")
+        return self
+
+
+class ReceiptCreate(BaseModel):
+    expected_configuration_snapshot_id: UUID
+    posting_date: date
+    supplier_name: str = Field(min_length=1, max_length=200)
+    delivery_note_number: str = Field(min_length=1, max_length=100)
+    purchase_order_reference: str | None = Field(default=None, max_length=100)
+    invoice_reference: str | None = Field(default=None, max_length=100)
+    lines: list[ReceiptLineCreate] = Field(min_length=1)
+
+
+class ReceiptAuthorityView(BaseModel):
+    project_id: UUID
+    posting_date: date
+    configuration_snapshot_id: UUID
+    project_currency: str
+    products: list[OpeningStockAuthorityProduct]
+
+
+class ReceiptPreviewLine(OpeningStockPreviewLine):
+    batch_number: str | None
+    manufacture_date: date | None
+    expiry_date: date | None
+    cost_source: Literal["supplier_document", "configured_effective_price", "unavailable"]
+
+
+class ReceiptPreviewView(BaseModel):
+    project_id: UUID
+    posting_date: date
+    configuration_snapshot_id: UUID
+    supplier_name: str
+    delivery_note_number: str
+    purchase_order_reference: str | None
+    invoice_reference: str | None
+    lines: list[ReceiptPreviewLine]
+    currencies: dict[str, str]
+
+
 class InventoryReversalCreate(BaseModel):
     posting_date: date
     reason: str = Field(min_length=1, max_length=1000)
@@ -234,11 +297,16 @@ class InventoryLedgerLineView(BaseModel):
     product_definition_id: UUID
     configuration_product_version_id: UUID
     product_price_version_id: UUID | None
+    reversal_of_line_id: UUID | None = None
+    batch_number: str | None = None
+    manufacture_date: date | None = None
+    expiry_date: date | None = None
     entered_quantity: str
     entered_unit_code: ProductUnitCode
     canonical_signed_quantity: str
     canonical_unit_code: Literal["kg", "L", "each"]
     price_status: Literal["ready", "unavailable"]
+    cost_source: Literal["supplier_document", "configured_effective_price", "unavailable"]
     applied_unit_price: str | None
     price_basis_unit_code: ProductUnitCode | None
     price_effective_from: date | None
@@ -253,12 +321,17 @@ class InventoryPostingView(BaseModel):
     id: UUID
     project_id: UUID
     source_configuration_snapshot_id: UUID
-    posting_type: Literal["opening_stock", "reversal"]
+    posting_type: Literal["opening_stock", "receipt", "reversal"]
     status: Literal["posted"]
     posting_date: date
     reversal_of_posting_id: UUID | None
     reversal_posting_id: UUID | None = None
     reason: str | None
+    supplier_name: str | None = None
+    delivery_note_number: str | None = None
+    purchase_order_reference: str | None = None
+    invoice_reference: str | None = None
+    received_by_user_id: UUID | None = None
     posted_by: UUID
     posted_at: datetime
     lines: list[InventoryLedgerLineView]

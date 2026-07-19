@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -260,6 +261,15 @@ class InventoryPosting(TenantMixin, Base):
         PGUUID(as_uuid=True), ForeignKey("inventory_postings.id")
     )
     reason: Mapped[str | None] = mapped_column(Text)
+    supplier_name: Mapped[str | None] = mapped_column(String(200))
+    supplier_name_normalized: Mapped[str | None] = mapped_column(String(200))
+    delivery_note_number: Mapped[str | None] = mapped_column(String(100))
+    delivery_note_normalized: Mapped[str | None] = mapped_column(String(100))
+    purchase_order_reference: Mapped[str | None] = mapped_column(String(100))
+    invoice_reference: Mapped[str | None] = mapped_column(String(100))
+    received_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id")
+    )
     posted_by: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     posted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -267,14 +277,33 @@ class InventoryPosting(TenantMixin, Base):
     __table_args__ = (
         UniqueConstraint("reversal_of_posting_id", name="uq_inventory_postings_reversal"),
         CheckConstraint(
-            "posting_type IN ('opening_stock','reversal')", name="ck_inventory_postings_type"
+            "posting_type IN ('opening_stock','receipt','reversal')",
+            name="ck_inventory_postings_type",
         ),
         CheckConstraint("status IN ('building','posted')", name="ck_inventory_postings_status"),
         CheckConstraint(
-            "(posting_type = 'opening_stock' AND reversal_of_posting_id IS NULL) OR "
+            "(posting_type IN ('opening_stock','receipt') AND reversal_of_posting_id IS NULL) OR "
             "(posting_type = 'reversal' AND reversal_of_posting_id IS NOT NULL "
             "AND reason IS NOT NULL)",
             name="ck_inventory_postings_reversal_context",
+        ),
+        CheckConstraint(
+            "(posting_type = 'receipt' AND supplier_name IS NOT NULL "
+            "AND supplier_name_normalized IS NOT NULL AND delivery_note_number IS NOT NULL "
+            "AND delivery_note_normalized IS NOT NULL AND received_by_user_id IS NOT NULL) OR "
+            "(posting_type <> 'receipt' AND supplier_name IS NULL "
+            "AND supplier_name_normalized IS NULL AND delivery_note_number IS NULL "
+            "AND delivery_note_normalized IS NULL AND purchase_order_reference IS NULL "
+            "AND invoice_reference IS NULL AND received_by_user_id IS NULL)",
+            name="ck_inventory_postings_receipt_context",
+        ),
+        Index(
+            "uq_inventory_receipt_delivery_note",
+            "project_id",
+            "supplier_name_normalized",
+            "delivery_note_normalized",
+            unique=True,
+            postgresql_where=text("posting_type = 'receipt'"),
         ),
         Index("ix_inventory_postings_project_date", "project_id", "posting_date"),
     )
@@ -298,11 +327,18 @@ class InventoryLedgerLine(TenantMixin, Base):
     product_price_version_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("product_price_history.id")
     )
+    reversal_of_line_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inventory_ledger_lines.id"), unique=True
+    )
+    batch_number: Mapped[str | None] = mapped_column(String(100))
+    manufacture_date: Mapped[date | None] = mapped_column(Date)
+    expiry_date: Mapped[date | None] = mapped_column(Date)
     entered_quantity: Mapped[Decimal] = mapped_column(Numeric(24, 12), nullable=False)
     entered_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
     canonical_signed_quantity: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
     canonical_unit_code: Mapped[str] = mapped_column(String(20), nullable=False)
     price_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    cost_source: Mapped[str] = mapped_column(String(40), nullable=False)
     applied_unit_price: Mapped[Decimal | None] = mapped_column(Numeric(24, 12))
     price_basis_unit_code: Mapped[str | None] = mapped_column(String(20))
     price_effective_from: Mapped[date | None] = mapped_column(Date)
@@ -312,20 +348,41 @@ class InventoryLedgerLine(TenantMixin, Base):
     posted_line_amount: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     frozen_product_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     __table_args__ = (
-        UniqueConstraint("posting_id", "product_definition_id", name="uq_inventory_line_product"),
+        Index(
+            "uq_inventory_line_product_batch",
+            "posting_id",
+            "product_definition_id",
+            text("COALESCE(batch_number, '')"),
+            unique=True,
+        ),
         CheckConstraint(
             "price_status IN ('ready','unavailable')", name="ck_inventory_lines_price_status"
         ),
         CheckConstraint(
-            "(price_status = 'ready' AND product_price_version_id IS NOT NULL AND "
+            "(cost_source = 'configured_effective_price' AND price_status = 'ready' "
+            "AND product_price_version_id IS NOT NULL AND "
             "applied_unit_price IS NOT NULL AND price_basis_unit_code IS NOT NULL AND "
             "price_effective_from IS NOT NULL AND currency IS NOT NULL AND "
             "currency_minor_unit_scale IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
-            "(price_status = 'unavailable' AND product_price_version_id IS NULL AND "
+            "(cost_source = 'supplier_document' AND price_status = 'ready' "
+            "AND product_price_version_id IS NULL AND applied_unit_price IS NOT NULL "
+            "AND price_basis_unit_code IS NOT NULL AND price_effective_from IS NULL "
+            "AND price_effective_to IS NULL AND currency IS NOT NULL "
+            "AND currency_minor_unit_scale IS NOT NULL AND posted_line_amount IS NOT NULL) OR "
+            "(cost_source = 'unavailable' AND price_status = 'unavailable' "
+            "AND product_price_version_id IS NULL AND "
             "applied_unit_price IS NULL AND price_basis_unit_code IS NULL AND "
             "price_effective_from IS NULL AND price_effective_to IS NULL AND currency IS NULL AND "
             "currency_minor_unit_scale IS NULL AND posted_line_amount IS NULL)",
             name="ck_inventory_lines_price_completeness",
+        ),
+        CheckConstraint(
+            "cost_source IN ('supplier_document','configured_effective_price','unavailable')",
+            name="ck_inventory_lines_cost_source",
+        ),
+        CheckConstraint(
+            "expiry_date IS NULL OR manufacture_date IS NULL OR expiry_date > manufacture_date",
+            name="ck_inventory_lines_dates",
         ),
         CheckConstraint(
             "entered_unit_code IN ('kg','t','lb','L','m3','gal_us','bbl','each','package')",

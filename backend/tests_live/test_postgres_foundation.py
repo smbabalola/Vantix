@@ -45,6 +45,9 @@ from app.schemas import (
     ProductPricePatch,
     ProjectCreate,
     ProjectProductCreate,
+    ReceiptCreate,
+    ReceiptLineCreate,
+    ReceiptSupplierPrice,
 )
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -1618,7 +1621,7 @@ def test_vtx_mvp_001_live_migration_head_and_force_rls_are_active() -> None:
     engine = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_inventory_authority_precision"
+            "0009_inventory_receipts"
         )
         flags = connection.execute(
             text(
@@ -1663,39 +1666,6 @@ def test_vtx_mvp_001_upgrade_from_merged_0007_installs_inventory_runtime_guards(
             )
             assert "round(expected_canonical, 12)" not in str(old_line_guard)
 
-        repository = PostgresFoundationRepository()
-        auth = context()
-        project = prepare_project(repository, auth)
-        first = create_configuration(repository, auth, project.id, valid_configuration())
-        active_v1 = activate_configuration(
-            repository, auth, project.id, first.id, "upgrade-path-v1"
-        )
-        assert active_v1.snapshot_id is not None
-        authority = repository.opening_stock_authority(auth, project.id, date(2026, 7, 18))
-        original = repository.post_opening_stock(
-            auth,
-            project.id,
-            OpeningStockCreate(
-                expected_configuration_snapshot_id=active_v1.snapshot_id,
-                posting_date="2026-07-18",
-                lines=[
-                    OpeningStockLineCreate(
-                        product_definition_id=authority.products[0].product_definition_id,
-                        entered_quantity="1",
-                        entered_unit_code="package",
-                    )
-                ],
-            ),
-            "upgrade-path-opening",
-        )
-        second = create_configuration(
-            repository, auth, project.id, ConfigurationCreate(copy_active=True), "upgrade-path-v2"
-        )
-        active_v2 = activate_configuration(
-            repository, auth, project.id, second.id, "upgrade-path-activate-v2"
-        )
-        assert active_v2.snapshot_id is not None
-
         migrate("upgrade", "0008_inventory_authority_precision")
         with admin.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
@@ -1709,37 +1679,65 @@ def test_vtx_mvp_001_upgrade_from_merged_0007_installs_inventory_runtime_guards(
             )
             assert "opening stock requires the current configuration snapshot" in str(posting_guard)
             assert "round(expected_canonical, 12)" in str(line_guard)
+        admin.dispose()
+    finally:
+        migrate("upgrade", "head")
 
-        with pytest.raises(DBAPIError), admin.begin() as connection:
-            connection.execute(
-                insert(InventoryPosting).values(
-                    id=uuid4(),
-                    organisation_id=auth.organisation_id,
-                    project_id=project.id,
-                    source_configuration_snapshot_id=active_v1.snapshot_id,
-                    posting_type="opening_stock",
-                    status="building",
-                    posting_date=date(2026, 7, 18),
-                    reversal_of_posting_id=None,
-                    reason=None,
-                    posted_by=auth.user_id,
-                )
+
+def test_vtx_mvp_001_upgrade_from_0008_delivers_receipt_schema_and_guards() -> None:
+    migration_environment = {
+        **os.environ,
+        "VANTIX_DATABASE_URL": os.environ["VANTIX_ADMIN_DATABASE_URL"],
+    }
+
+    def migrate(*arguments: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", *arguments],
+            check=True,
+            cwd=os.getcwd(),
+            env=migration_environment,
+            capture_output=True,
+            text=True,
+        )
+
+    migrate("downgrade", "0008_inventory_authority_precision")
+    try:
+        admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+        with admin.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0008_inventory_authority_precision"
             )
-        with pytest.raises(DBAPIError), admin.begin() as connection:
-            connection.execute(
-                insert(InventoryPosting).values(
-                    id=uuid4(),
-                    organisation_id=auth.organisation_id,
-                    project_id=project.id,
-                    source_configuration_snapshot_id=active_v2.snapshot_id,
-                    posting_type="reversal",
-                    status="building",
-                    posting_date=date(2026, 7, 19),
-                    reversal_of_posting_id=original.id,
-                    reason="Wrong snapshot after upgrade",
-                    posted_by=auth.user_id,
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.columns "
+                        "WHERE table_name = 'inventory_postings' AND column_name = 'supplier_name'"
+                    )
                 )
+                == 0
             )
+        migrate("upgrade", "0009_inventory_receipts")
+        with admin.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0009_inventory_receipts"
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.columns "
+                        "WHERE table_name = 'inventory_postings' AND column_name = 'supplier_name'"
+                    )
+                )
+                == 1
+            )
+            posting_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_posting()'::regprocedure)")
+            )
+            line_guard = connection.scalar(
+                text("SELECT pg_get_functiondef('vantix_guard_inventory_line()'::regprocedure)")
+            )
+            assert "receipt documentary authority mismatch" in str(posting_guard)
+            assert "supplier receipt price authority mismatch" in str(line_guard)
         admin.dispose()
     finally:
         migrate("upgrade", "head")
@@ -1895,6 +1893,180 @@ def test_vtx_pro_004_005_live_opening_cost_is_frozen_and_reversal_is_exact() -> 
     admin.dispose()
 
 
+def test_vtx_trf_007_012_live_receipt_freezes_authority_and_reverses_exactly() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-receipt-v1"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.receipt_authority(auth, project.id, date(2026, 7, 18))
+    request = ReceiptCreate(
+        expected_configuration_snapshot_id=authority.configuration_snapshot_id,
+        posting_date="2026-07-18",
+        supplier_name=" North  Sea Chemicals ",
+        delivery_note_number=" DN-1001 ",
+        purchase_order_reference="PO-7",
+        lines=[
+            ReceiptLineCreate(
+                product_definition_id=authority.products[0].product_definition_id,
+                entered_quantity="40",
+                entered_unit_code="package",
+                batch_number="LOT-A",
+                manufacture_date="2026-01-01",
+                expiry_date="2028-01-01",
+                supplier_price=ReceiptSupplierPrice(
+                    unit_price="17.80",
+                    price_basis_unit_code="package",
+                    currency="GBP",
+                ),
+            )
+        ],
+    )
+    preview = repository.preview_receipt(auth, project.id, request)
+    assert preview.supplier_name == "North Sea Chemicals"
+    assert preview.lines[0].canonical_quantity == "1000"
+    assert preview.lines[0].cost_source == "supplier_document"
+    assert preview.lines[0].line_amount == "712.00"
+    posted = repository.post_receipt(auth, project.id, request, "receipt-live-1")
+    assert posted.received_by_user_id == auth.user_id
+    assert posted.lines[0].canonical_signed_quantity == preview.lines[0].canonical_quantity
+    assert posted.lines[0].posted_line_amount == "712.00"
+    assert repository.post_receipt(auth, project.id, request, "receipt-live-1").id == posted.id
+
+    admin = create_engine(os.environ["VANTIX_ADMIN_DATABASE_URL"])
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=active.snapshot_id,
+                posting_type="receipt",
+                status="posted",
+                posting_date=date(2026, 7, 18),
+                supplier_name="Empty Receipt",
+                supplier_name_normalized="empty receipt",
+                delivery_note_number="EMPTY-1",
+                delivery_note_normalized="empty-1",
+                received_by_user_id=auth.user_id,
+                posted_by=auth.user_id,
+            )
+        )
+
+    forged_posting_id = uuid4()
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=forged_posting_id,
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=active.snapshot_id,
+                posting_type="receipt",
+                status="building",
+                posting_date=date(2026, 7, 18),
+                supplier_name="Forge Supplier",
+                supplier_name_normalized="forge supplier",
+                delivery_note_number="FORGE-1",
+                delivery_note_normalized="forge-1",
+                received_by_user_id=auth.user_id,
+                posted_by=auth.user_id,
+            )
+        )
+        connection.execute(
+            insert(InventoryLedgerLine).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                posting_id=forged_posting_id,
+                product_definition_id=posted.lines[0].product_definition_id,
+                configuration_product_version_id=(posted.lines[0].configuration_product_version_id),
+                product_price_version_id=None,
+                reversal_of_line_id=None,
+                batch_number="FORGED",
+                entered_quantity=Decimal("1"),
+                entered_unit_code="package",
+                canonical_signed_quantity=Decimal("999"),
+                canonical_unit_code="kg",
+                price_status="ready",
+                cost_source="supplier_document",
+                applied_unit_price=Decimal("17.8"),
+                price_basis_unit_code="package",
+                currency="GBP",
+                currency_minor_unit_scale=2,
+                posted_line_amount=Decimal("17.80"),
+                frozen_product_json=posted.lines[0].frozen_product,
+            )
+        )
+
+    with pytest.raises(HTTPException) as duplicate:
+        repository.post_receipt(auth, project.id, request, "receipt-live-duplicate")
+    assert duplicate.value.detail["code"] == "RECEIPT_DELIVERY_NOTE_EXISTS"
+
+    reversal = repository.reverse_inventory_posting(
+        auth,
+        project.id,
+        posted.id,
+        InventoryReversalCreate(posting_date="2026-07-19", reason="Document voided"),
+        "receipt-live-reversal",
+    )
+    assert reversal.lines[0].reversal_of_line_id == posted.lines[0].id
+    assert reversal.lines[0].canonical_signed_quantity == "-1000"
+    assert reversal.lines[0].posted_line_amount == "-712.00"
+    assert reversal.lines[0].cost_source == "supplier_document"
+
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            update(InventoryLedgerLine)
+            .where(InventoryLedgerLine.id == posted.lines[0].id)
+            .values(applied_unit_price=Decimal("1.00"))
+        )
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=posted.source_configuration_snapshot_id,
+                posting_type="reversal",
+                status="building",
+                posting_date=date(2026, 7, 20),
+                reversal_of_posting_id=posted.id,
+                reason="Second reversal",
+                posted_by=auth.user_id,
+            )
+        )
+
+    second = create_configuration(
+        repository, auth, project.id, ConfigurationCreate(copy_active=True), "receipt-v2"
+    )
+    active_v2 = activate_configuration(
+        repository, auth, project.id, second.id, "activate-receipt-v2"
+    )
+    assert active_v2.snapshot_id is not None
+    with pytest.raises(DBAPIError), admin.begin() as connection:
+        connection.execute(
+            insert(InventoryPosting).values(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project.id,
+                source_configuration_snapshot_id=active.snapshot_id,
+                posting_type="receipt",
+                status="building",
+                posting_date=date(2026, 7, 20),
+                supplier_name="Stale Supplier",
+                supplier_name_normalized="stale supplier",
+                delivery_note_number="STALE-1",
+                delivery_note_normalized="stale-1",
+                received_by_user_id=auth.user_id,
+                posted_by=auth.user_id,
+            )
+        )
+    admin.dispose()
+
+
 def test_vtx_auth_004_inventory_tables_enforce_cross_tenant_rls() -> None:
     repository = PostgresFoundationRepository()
     auth = context()
@@ -1934,6 +2106,100 @@ def test_vtx_auth_004_inventory_tables_enforce_cross_tenant_rls() -> None:
         )
         assert session.scalar(select(func.count()).select_from(InventoryPosting)) == 0
         assert session.scalar(select(func.count()).select_from(InventoryLedgerLine)) == 0
+
+
+def test_vtx_trf_010_concurrent_receipt_document_identity_posts_once() -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-concurrent-receipt"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.receipt_authority(auth, project.id, date(2026, 7, 18))
+    request = ReceiptCreate(
+        expected_configuration_snapshot_id=active.snapshot_id,
+        posting_date="2026-07-18",
+        supplier_name="Concurrent Supplier",
+        delivery_note_number="DN-CONCURRENT",
+        lines=[
+            ReceiptLineCreate(
+                product_definition_id=authority.products[0].product_definition_id,
+                entered_quantity="1",
+                entered_unit_code="package",
+            )
+        ],
+    )
+
+    def post(key: str) -> InventoryPostingView | str:
+        try:
+            return repository.post_receipt(auth, project.id, request, key)
+        except HTTPException as exc:
+            return str(exc.detail["code"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(post, ["receipt-concurrent-a", "receipt-concurrent-b"]))
+    assert sum(not isinstance(result, str) for result in results) == 1
+    assert results.count("RECEIPT_DELIVERY_NOTE_EXISTS") == 1
+    assert len(repository.list_inventory_postings(auth, project.id)) == 1
+
+
+def test_vtx_trf_010_receipt_audit_failure_rolls_back_every_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = PostgresFoundationRepository()
+    auth = context()
+    project = prepare_project(repository, auth)
+    configuration = create_configuration(repository, auth, project.id, valid_configuration())
+    active = activate_configuration(
+        repository, auth, project.id, configuration.id, "activate-rollback-receipt"
+    )
+    assert active.snapshot_id is not None
+    authority = repository.receipt_authority(auth, project.id, date(2026, 7, 18))
+    request = ReceiptCreate(
+        expected_configuration_snapshot_id=active.snapshot_id,
+        posting_date="2026-07-18",
+        supplier_name="Rollback Supplier",
+        delivery_note_number="DN-ROLLBACK",
+        lines=[
+            ReceiptLineCreate(
+                product_definition_id=authority.products[0].product_definition_id,
+                entered_quantity="1",
+                entered_unit_code="package",
+            )
+        ],
+    )
+
+    def fail_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("forced receipt audit failure")
+
+    monkeypatch.setattr(repository, "_audit", fail_audit)
+    with pytest.raises(RuntimeError, match="forced receipt audit failure"):
+        repository.post_receipt(auth, project.id, request, "receipt-rollback")
+    with SessionFactory.begin() as session:
+        set_tenant_context(
+            session,
+            user_id=auth.user_id,
+            organisation_id=auth.organisation_id,
+            project_ids=(project.id,),
+        )
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(InventoryPosting)
+                .where(InventoryPosting.posting_type == "receipt")
+            )
+            == 0
+        )
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(IdempotencyRecord)
+                .where(IdempotencyRecord.operation_type == "post_inventory_receipt")
+            )
+            == 0
+        )
 
 
 def test_vtx_pro_004_stale_reviewed_snapshot_rolls_back_posting_idempotency_and_audit() -> None:

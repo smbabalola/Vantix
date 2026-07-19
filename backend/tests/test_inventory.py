@@ -4,6 +4,7 @@ import pytest
 from vantix_core.inventory import (
     InventoryValidationError,
     build_opening_line,
+    build_receipt_line,
     build_reversal_line,
     calculate_posted_amount,
     convert_opening_quantity,
@@ -102,3 +103,42 @@ def test_vtx_rec_004_015_reversal_is_exact_opposite_without_repricing() -> None:
     )
     assert Decimal(reversal["posted_line_amount"]) == -Decimal(original["posted_line_amount"])
     assert reversal["product_price_version_id"] == original["product_price_version_id"]
+
+
+def test_vtx_trf_008_supplier_document_price_has_explicit_precedence() -> None:
+    line = build_receipt_line(
+        entered_quantity="40",
+        entered_unit_code="package",
+        product={"package_size": "25", "package_unit_code": "kg"},
+        supplier_price={
+            "unit_price": "17.80",
+            "price_basis_unit_code": "package",
+            "currency": "GBP",
+        },
+        configured_price={
+            "id": "00000000-0000-4000-8000-000000000001",
+            "effective_from": "2026-01-01",
+            "effective_to": None,
+            "unit_price": "18.50",
+            "price_basis_unit_code": "package",
+            "currency": "GBP",
+        },
+        project_currency="GBP",
+    )
+    assert line["cost_source"] == "supplier_document"
+    assert line["product_price_version_id"] is None
+    assert line["canonical_signed_quantity"] == "1000"
+    assert line["posted_line_amount"] == "712.00"
+
+
+def test_vtx_trf_009_receipt_missing_all_price_authority_is_unavailable() -> None:
+    line = build_receipt_line(
+        entered_quantity="2",
+        entered_unit_code="package",
+        product={"package_size": "25", "package_unit_code": "kg"},
+        supplier_price=None,
+        configured_price=None,
+        project_currency="GBP",
+    )
+    assert line["cost_source"] == "unavailable"
+    assert line["posted_line_amount"] is None

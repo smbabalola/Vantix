@@ -19,6 +19,9 @@ INVENTORY_LEDGER = Path("backend/alembic/versions/0007_inventory_opening_stock.p
 INVENTORY_HARDENING = Path(
     "backend/alembic/versions/0008_inventory_authority_precision.py"
 ).read_text(encoding="utf-8")
+INVENTORY_RECEIPTS = Path("backend/alembic/versions/0009_inventory_receipts.py").read_text(
+    encoding="utf-8"
+)
 
 
 def test_vtx_auth_004_005_tenant_tables_enable_and_force_rls() -> None:
@@ -124,3 +127,16 @@ def test_vtx_pro_004_inventory_hardening_is_delivered_after_merged_0007() -> Non
     downgrade = INVENTORY_HARDENING.split("def downgrade()", maxsplit=1)[1]
     assert "_posting_guard(hardened=False)" in downgrade
     assert "_line_guard(rounded=False)" in downgrade
+
+
+def test_vtx_trf_007_012_receipts_extend_merged_ledger_without_rewriting_history() -> None:
+    assert 'revision: str = "0009_inventory_receipts"' in INVENTORY_RECEIPTS
+    assert 'down_revision: str | None = "0008_inventory_authority_precision"' in INVENTORY_RECEIPTS
+    assert "RENAME TO vantix_guard_inventory_posting_v8" in INVENTORY_RECEIPTS
+    assert "RENAME TO vantix_guard_inventory_line_v8" in INVENTORY_RECEIPTS
+    assert "receipt documentary authority mismatch" in INVENTORY_RECEIPTS
+    assert "inventory posting requires at least one ledger line" in INVENTORY_RECEIPTS
+    assert "frozen price authority mismatch" in INVENTORY_RECEIPTS
+    assert "supplier receipt price authority mismatch" in INVENTORY_RECEIPTS
+    assert "reversal line must exactly negate frozen original" in INVENTORY_RECEIPTS
+    assert "cannot downgrade inventory receipts while receipt history exists" in INVENTORY_RECEIPTS

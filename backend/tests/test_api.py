@@ -234,6 +234,122 @@ def test_vtx_rec_004_opening_reversal_is_exact_and_preserves_original(
     assert history[0]["reversal_posting_id"] == reversal.json()["id"]
 
 
+def test_vtx_trf_007_012_receipt_preview_post_retry_history_and_exact_reversal(
+    client: TestClient,
+) -> None:
+    _, user_id, editor_headers, project, _ = setup_report(client)
+    inventory_headers = {
+        **editor_headers,
+        "X-Vantix-Capabilities": "view_inventory,post_inventory",
+    }
+    authority = client.get(
+        f"/api/v1/projects/{project['id']}/inventory/receipt-authority",
+        headers=inventory_headers,
+        params={"posting_date": "2026-07-18"},
+    )
+    assert authority.status_code == 200
+    product = authority.json()["products"][0]
+    request = {
+        "expected_configuration_snapshot_id": authority.json()["configuration_snapshot_id"],
+        "posting_date": "2026-07-18",
+        "supplier_name": "  North   Sea Chemicals ",
+        "delivery_note_number": " DN-1001 ",
+        "purchase_order_reference": "PO-7",
+        "invoice_reference": None,
+        "lines": [
+            {
+                "product_definition_id": product["product_definition_id"],
+                "entered_quantity": "40",
+                "entered_unit_code": "package",
+                "batch_number": "LOT-A",
+                "manufacture_date": "2026-01-01",
+                "expiry_date": "2028-01-01",
+                "supplier_price": {
+                    "unit_price": "17.80",
+                    "price_basis_unit_code": "package",
+                    "currency": "GBP",
+                },
+            }
+        ],
+    }
+    preview = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/receipts/preview",
+        headers=inventory_headers,
+        json=request,
+    )
+    assert preview.status_code == 200
+    assert preview.json()["supplier_name"] == "North Sea Chemicals"
+    assert preview.json()["lines"][0]["canonical_quantity"] == "1000"
+    assert preview.json()["lines"][0]["cost_source"] == "supplier_document"
+    assert preview.json()["lines"][0]["line_amount"] == "712.00"
+    post_headers = {**inventory_headers, "Idempotency-Key": "receipt-dn-1001"}
+    posted = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/receipts",
+        headers=post_headers,
+        json=request,
+    )
+    assert posted.status_code == 201
+    assert posted.json()["received_by_user_id"] == str(user_id)
+    assert posted.json()["lines"][0]["posted_line_amount"] == "712.00"
+    retry = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/receipts",
+        headers=post_headers,
+        json=request,
+    )
+    assert retry.json() == posted.json()
+    duplicate = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/receipts",
+        headers={**inventory_headers, "Idempotency-Key": "different-receipt-key"},
+        json=request,
+    )
+    assert duplicate.status_code == 409
+    reversal = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/{posted.json()['id']}/reversals",
+        headers={**inventory_headers, "Idempotency-Key": "reverse-receipt-dn-1001"},
+        json={"posting_date": "2026-07-19", "reason": "Supplier document voided"},
+    )
+    assert reversal.status_code == 201
+    assert reversal.json()["lines"][0]["canonical_signed_quantity"] == "-1000"
+    assert reversal.json()["lines"][0]["posted_line_amount"] == "-712.00"
+    assert reversal.json()["lines"][0]["cost_source"] == "supplier_document"
+    assert reversal.json()["lines"][0]["reversal_of_line_id"] == posted.json()["lines"][0]["id"]
+
+
+def test_vtx_trf_009_receipt_cost_unavailable_is_not_zero(client: TestClient) -> None:
+    _, _, editor_headers, project, _ = setup_report(client)
+    inventory_headers = {
+        **editor_headers,
+        "X-Vantix-Capabilities": "view_inventory,post_inventory",
+    }
+    authority = client.get(
+        f"/api/v1/projects/{project['id']}/inventory/receipt-authority",
+        headers=inventory_headers,
+        params={"posting_date": "2025-12-31"},
+    ).json()
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/inventory-postings/receipts/preview",
+        headers=inventory_headers,
+        json={
+            "expected_configuration_snapshot_id": authority["configuration_snapshot_id"],
+            "posting_date": "2025-12-31",
+            "supplier_name": "Supplier A",
+            "delivery_note_number": "DN-NO-PRICE",
+            "lines": [
+                {
+                    "product_definition_id": authority["products"][0]["product_definition_id"],
+                    "entered_quantity": "1",
+                    "entered_unit_code": "package",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    line = response.json()["lines"][0]
+    assert line["cost_source"] == "unavailable"
+    assert line["line_amount"] is None
+    assert response.json()["currencies"] == {}
+
+
 def test_vtx_pro_004_stale_reviewed_authority_creates_no_memory_posting_or_idempotency(
     client: TestClient, foundation_store: FoundationStore
 ) -> None:

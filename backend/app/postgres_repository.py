@@ -20,9 +20,11 @@ from vantix_core.canonical import payload_checksum
 from vantix_core.inventory import (
     InventoryValidationError,
     build_opening_line,
+    build_receipt_line,
     build_reversal_line,
     calculate_package_count,
     money_string,
+    normalise_receipt_reference,
 )
 from vantix_core.products import (
     ProductValidationError,
@@ -92,6 +94,10 @@ from .schemas import (
     ProjectProductView,
     ProjectView,
     ReadinessView,
+    ReceiptAuthorityView,
+    ReceiptCreate,
+    ReceiptPreviewLine,
+    ReceiptPreviewView,
     ReportView,
     RevisionView,
 )
@@ -1173,11 +1179,16 @@ class PostgresFoundationRepository:
             product_definition_id=line.product_definition_id,
             configuration_product_version_id=line.configuration_product_version_id,
             product_price_version_id=line.product_price_version_id,
+            reversal_of_line_id=line.reversal_of_line_id,
+            batch_number=line.batch_number,
+            manufacture_date=line.manufacture_date,
+            expiry_date=line.expiry_date,
             entered_quantity=cls._decimal_string(line.entered_quantity),
             entered_unit_code=cast(Any, line.entered_unit_code),
             canonical_signed_quantity=cls._decimal_string(line.canonical_signed_quantity),
             canonical_unit_code=cast(Any, line.canonical_unit_code),
             price_status=cast(Any, line.price_status),
+            cost_source=cast(Any, line.cost_source),
             applied_unit_price=(
                 cls._decimal_string(line.applied_unit_price)
                 if line.applied_unit_price is not None
@@ -1204,7 +1215,11 @@ class PostgresFoundationRepository:
         lines = session.scalars(
             select(InventoryLedgerLine)
             .where(InventoryLedgerLine.posting_id == posting.id)
-            .order_by(InventoryLedgerLine.product_definition_id)
+            .order_by(
+                InventoryLedgerLine.product_definition_id,
+                InventoryLedgerLine.batch_number,
+                InventoryLedgerLine.id,
+            )
         ).all()
         reversal_id = session.scalar(
             select(InventoryPosting.id).where(
@@ -1222,6 +1237,11 @@ class PostgresFoundationRepository:
             reversal_of_posting_id=posting.reversal_of_posting_id,
             reversal_posting_id=reversal_id,
             reason=posting.reason,
+            supplier_name=posting.supplier_name,
+            delivery_note_number=posting.delivery_note_number,
+            purchase_order_reference=posting.purchase_order_reference,
+            invoice_reference=posting.invoice_reference,
+            received_by_user_id=posting.received_by_user_id,
             posted_by=posting.posted_by,
             posted_at=posting.posted_at,
             lines=[cls._inventory_line_view(line) for line in lines],
@@ -1494,6 +1514,211 @@ class PostgresFoundationRepository:
             resolved = self._resolve_opening_lines(session, project, body)
             return self._preview_view(project, body, resolved)
 
+    def receipt_authority(
+        self, auth: AuthContext, project_id: UUID, posting_date: date
+    ) -> ReceiptAuthorityView:
+        authority = self.opening_stock_authority(auth, project_id, posting_date)
+        return ReceiptAuthorityView(
+            project_id=authority.project_id,
+            posting_date=authority.posting_date,
+            configuration_snapshot_id=authority.configuration_snapshot_id,
+            project_currency=self.get_project(auth, project_id).currency,
+            products=[
+                product.model_copy(update={"opened_by_posting_id": None})
+                for product in authority.products
+            ],
+        )
+
+    def _resolve_receipt_lines(
+        self,
+        session: Session,
+        project: Project,
+        body: ReceiptCreate,
+    ) -> list[dict[str, Any]]:
+        snapshot = session.scalar(
+            select(ConfigurationSnapshot).where(
+                ConfigurationSnapshot.id == body.expected_configuration_snapshot_id,
+                ConfigurationSnapshot.project_id == project.id,
+            )
+        )
+        if snapshot is None:
+            raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
+        definition_ids = {line.product_definition_id for line in body.lines}
+        products = session.scalars(
+            select(ProjectProduct).where(
+                ProjectProduct.configuration_version_id == snapshot.configuration_version_id,
+                ProjectProduct.product_definition_id.in_(definition_ids),
+                ProjectProduct.inventory_applicable.is_(True),
+                ProjectProduct.active.is_(True),
+            )
+        ).all()
+        by_definition = {product.product_definition_id: product for product in products}
+        if set(by_definition) != definition_ids:
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "RECEIPT_PRODUCT_NOT_AUTHORISED")
+        seen: set[tuple[UUID, str]] = set()
+        resolved: list[dict[str, Any]] = []
+        for requested in body.lines:
+            batch = " ".join((requested.batch_number or "").strip().split()) or None
+            line_identity = (requested.product_definition_id, (batch or "").lower())
+            if line_identity in seen:
+                raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "DUPLICATE_RECEIPT_LINE")
+            seen.add(line_identity)
+            product = by_definition[requested.product_definition_id]
+            price = session.scalar(
+                select(ProductPrice)
+                .where(
+                    ProductPrice.project_product_id == product.id,
+                    ProductPrice.effective_from <= body.posting_date,
+                    ProductPrice.effective_to.is_(None)
+                    | (ProductPrice.effective_to > body.posting_date),
+                )
+                .order_by(ProductPrice.effective_from.desc())
+                .limit(1)
+            )
+            frozen_product = {
+                "item_code": product.item_code,
+                "item_name": product.item_name,
+                "alternate_name": product.alternate_name,
+                "packaging": product.packaging,
+                "package_size": self._decimal_string(product.package_size),
+                "package_unit_code": product.package_unit_code,
+                "inventory_unit_code": product.inventory_unit_code,
+                "specific_gravity": (
+                    self._decimal_string(product.specific_gravity)
+                    if product.specific_gravity is not None
+                    else None
+                ),
+            }
+            price_authority = (
+                {
+                    "id": price.id,
+                    "effective_from": price.effective_from,
+                    "effective_to": price.effective_to,
+                    "unit_price": price.unit_price,
+                    "price_basis_unit_code": price.price_basis_unit_code,
+                    "currency": price.currency,
+                }
+                if price
+                else None
+            )
+            try:
+                frozen = build_receipt_line(
+                    entered_quantity=requested.entered_quantity,
+                    entered_unit_code=requested.entered_unit_code,
+                    product=frozen_product,
+                    supplier_price=(
+                        requested.supplier_price.model_dump()
+                        if requested.supplier_price is not None
+                        else None
+                    ),
+                    configured_price=price_authority,
+                    project_currency=project.currency,
+                )
+                package_count = calculate_package_count(
+                    frozen["canonical_signed_quantity"],
+                    package_size=cast(str, frozen_product["package_size"]),
+                    package_unit_code=cast(str, frozen_product["package_unit_code"]),
+                )
+            except InventoryValidationError as exc:
+                raise self._inventory_error(exc) from exc
+            resolved.append(
+                {
+                    "product": product,
+                    "price": price
+                    if frozen["cost_source"] == "configured_effective_price"
+                    else None,
+                    "frozen_product": frozen_product,
+                    "frozen": frozen,
+                    "package_count": package_count,
+                    "batch_number": batch,
+                    "manufacture_date": requested.manufacture_date,
+                    "expiry_date": requested.expiry_date,
+                }
+            )
+        return resolved
+
+    @staticmethod
+    def _receipt_preview_view(
+        project: Project, body: ReceiptCreate, resolved: list[dict[str, Any]]
+    ) -> ReceiptPreviewView:
+        supplier, _ = normalise_receipt_reference(body.supplier_name, field="supplier_name")
+        delivery, _ = normalise_receipt_reference(
+            body.delivery_note_number, field="delivery_note_number"
+        )
+        totals: dict[str, Decimal] = {}
+        lines: list[ReceiptPreviewLine] = []
+        for item in resolved:
+            product = cast(ProjectProduct, item["product"])
+            frozen = cast(dict[str, Any], item["frozen"])
+            if frozen["posted_line_amount"] is not None:
+                currency = cast(str, frozen["currency"])
+                totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
+                    frozen["posted_line_amount"]
+                )
+            lines.append(
+                ReceiptPreviewLine(
+                    product_definition_id=product.product_definition_id,
+                    configuration_product_version_id=product.id,
+                    item_code=product.item_code,
+                    item_name=product.item_name,
+                    entered_quantity=frozen["entered_quantity"],
+                    entered_unit_code=cast(Any, frozen["entered_unit_code"]),
+                    package_size=item["frozen_product"]["package_size"],
+                    package_unit_code=cast(Any, item["frozen_product"]["package_unit_code"]),
+                    canonical_quantity=frozen["canonical_signed_quantity"],
+                    canonical_unit_code=cast(Any, frozen["canonical_unit_code"]),
+                    package_count=item["package_count"],
+                    price_status=cast(Any, frozen["price_status"]),
+                    applied_unit_price=frozen["applied_unit_price"],
+                    price_basis_unit_code=cast(Any, frozen["price_basis_unit_code"]),
+                    price_effective_from=frozen["price_effective_from"],
+                    price_effective_to=frozen["price_effective_to"],
+                    currency=frozen["currency"],
+                    currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
+                    line_amount=frozen["posted_line_amount"],
+                    batch_number=item["batch_number"],
+                    manufacture_date=item["manufacture_date"],
+                    expiry_date=item["expiry_date"],
+                    cost_source=cast(Any, frozen["cost_source"]),
+                )
+            )
+        scales = {
+            cast(str, item["frozen"]["currency"]): cast(
+                int, item["frozen"]["currency_minor_unit_scale"]
+            )
+            for item in resolved
+            if item["frozen"]["currency"] is not None
+        }
+        return ReceiptPreviewView(
+            project_id=project.id,
+            posting_date=body.posting_date,
+            configuration_snapshot_id=body.expected_configuration_snapshot_id,
+            supplier_name=supplier,
+            delivery_note_number=delivery,
+            purchase_order_reference=body.purchase_order_reference,
+            invoice_reference=body.invoice_reference,
+            lines=lines,
+            currencies={
+                currency: money_string(amount, scales[currency])
+                for currency, amount in sorted(totals.items())
+            },
+        )
+
+    def preview_receipt(
+        self, auth: AuthContext, project_id: UUID, body: ReceiptCreate
+    ) -> ReceiptPreviewView:
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = self._project(session, auth, project_id)
+            capabilities = self._database_capabilities(session, auth, project_id)
+            if not capabilities.intersection(
+                {Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            if project.current_configuration_snapshot_id != body.expected_configuration_snapshot_id:
+                raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
+            resolved = self._resolve_receipt_lines(session, project, body)
+            return self._receipt_preview_view(project, body, resolved)
+
     def post_opening_stock(
         self,
         auth: AuthContext,
@@ -1566,11 +1791,16 @@ class PostgresFoundationRepository:
                         product_definition_id=product.product_definition_id,
                         configuration_product_version_id=product.id,
                         product_price_version_id=(price.id if price else None),
+                        reversal_of_line_id=None,
+                        batch_number=None,
+                        manufacture_date=None,
+                        expiry_date=None,
                         entered_quantity=Decimal(frozen["entered_quantity"]),
                         entered_unit_code=frozen["entered_unit_code"],
                         canonical_signed_quantity=Decimal(frozen["canonical_signed_quantity"]),
                         canonical_unit_code=frozen["canonical_unit_code"],
                         price_status=frozen["price_status"],
+                        cost_source=frozen["cost_source"],
                         applied_unit_price=(
                             Decimal(frozen["applied_unit_price"])
                             if frozen["applied_unit_price"]
@@ -1623,6 +1853,152 @@ class PostgresFoundationRepository:
             )
             return response
 
+    def post_receipt(
+        self,
+        auth: AuthContext,
+        project_id: UUID,
+        body: ReceiptCreate,
+        idempotency_key: str,
+    ) -> InventoryPostingView:
+        request = {"project_id": str(project_id), **body.model_dump(mode="json")}
+        request_hash = _request_hash(request)
+        with self._transaction(auth, project_ids=(project_id,)) as session:
+            project = session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
+            )
+            if project is None or project.organisation_id != auth.organisation_id:
+                raise _error(status.HTTP_404_NOT_FOUND, "PROJECT_NOT_FOUND")
+            if Capability.POST_INVENTORY not in self._database_capabilities(
+                session, auth, project_id
+            ):
+                raise _error(status.HTTP_403_FORBIDDEN, "CAPABILITY_DENIED")
+            existing = self._lock_idempotency(
+                session, auth, "post_inventory_receipt", idempotency_key, request_hash
+            )
+            if existing:
+                return InventoryPostingView.model_validate(existing.response_json)
+            if project.current_configuration_snapshot_id != body.expected_configuration_snapshot_id:
+                raise _error(status.HTTP_412_PRECONDITION_FAILED, "INVENTORY_AUTHORITY_CHANGED")
+            supplier, supplier_normalized = normalise_receipt_reference(
+                body.supplier_name, field="supplier_name"
+            )
+            delivery, delivery_normalized = normalise_receipt_reference(
+                body.delivery_note_number, field="delivery_note_number"
+            )
+            duplicate = session.scalar(
+                select(InventoryPosting.id).where(
+                    InventoryPosting.project_id == project_id,
+                    InventoryPosting.posting_type == "receipt",
+                    InventoryPosting.supplier_name_normalized == supplier_normalized,
+                    InventoryPosting.delivery_note_normalized == delivery_normalized,
+                )
+            )
+            if duplicate is not None:
+                raise _error(status.HTTP_409_CONFLICT, "RECEIPT_DELIVERY_NOTE_EXISTS")
+            definition_ids = sorted({line.product_definition_id for line in body.lines}, key=str)
+            session.scalars(
+                select(ProductDefinition)
+                .where(ProductDefinition.id.in_(definition_ids))
+                .order_by(ProductDefinition.id)
+                .with_for_update()
+            ).all()
+            resolved = self._resolve_receipt_lines(session, project, body)
+            posting = InventoryPosting(
+                id=uuid4(),
+                organisation_id=auth.organisation_id,
+                project_id=project_id,
+                source_configuration_snapshot_id=body.expected_configuration_snapshot_id,
+                posting_type="receipt",
+                status="building",
+                posting_date=body.posting_date,
+                reversal_of_posting_id=None,
+                reason=None,
+                supplier_name=supplier,
+                supplier_name_normalized=supplier_normalized,
+                delivery_note_number=delivery,
+                delivery_note_normalized=delivery_normalized,
+                purchase_order_reference=(body.purchase_order_reference or None),
+                invoice_reference=(body.invoice_reference or None),
+                received_by_user_id=auth.user_id,
+                posted_by=auth.user_id,
+            )
+            session.add(posting)
+            session.flush()
+            for item in resolved:
+                product = cast(ProjectProduct, item["product"])
+                price = cast(ProductPrice | None, item["price"])
+                frozen = cast(dict[str, Any], item["frozen"])
+                session.add(
+                    InventoryLedgerLine(
+                        id=uuid4(),
+                        organisation_id=auth.organisation_id,
+                        project_id=project_id,
+                        posting_id=posting.id,
+                        product_definition_id=product.product_definition_id,
+                        configuration_product_version_id=product.id,
+                        product_price_version_id=price.id if price else None,
+                        reversal_of_line_id=None,
+                        batch_number=item["batch_number"],
+                        manufacture_date=item["manufacture_date"],
+                        expiry_date=item["expiry_date"],
+                        entered_quantity=Decimal(frozen["entered_quantity"]),
+                        entered_unit_code=frozen["entered_unit_code"],
+                        canonical_signed_quantity=Decimal(frozen["canonical_signed_quantity"]),
+                        canonical_unit_code=frozen["canonical_unit_code"],
+                        price_status=frozen["price_status"],
+                        cost_source=frozen["cost_source"],
+                        applied_unit_price=(
+                            Decimal(frozen["applied_unit_price"])
+                            if frozen["applied_unit_price"] is not None
+                            else None
+                        ),
+                        price_basis_unit_code=frozen["price_basis_unit_code"],
+                        price_effective_from=(
+                            date.fromisoformat(frozen["price_effective_from"])
+                            if frozen["price_effective_from"]
+                            else None
+                        ),
+                        price_effective_to=(
+                            date.fromisoformat(frozen["price_effective_to"])
+                            if frozen["price_effective_to"]
+                            else None
+                        ),
+                        currency=frozen["currency"],
+                        currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
+                        posted_line_amount=(
+                            Decimal(frozen["posted_line_amount"])
+                            if frozen["posted_line_amount"] is not None
+                            else None
+                        ),
+                        frozen_product_json=deepcopy(item["frozen_product"]),
+                    )
+                )
+            posting.status = "posted"
+            session.flush()
+            response = self._inventory_posting_view(session, posting)
+            self._audit(
+                session,
+                auth,
+                project_id=project_id,
+                entity_type="inventory_posting",
+                entity_id=posting.id,
+                action="post_inventory_receipt",
+                before=None,
+                after=response.model_dump(mode="json"),
+            )
+            self._remember_idempotency(
+                session,
+                auth,
+                "post_inventory_receipt",
+                idempotency_key,
+                request_hash,
+                "inventory_posting",
+                posting.id,
+                response,
+                201,
+            )
+            return response
+
     def reverse_inventory_posting(
         self,
         auth: AuthContext,
@@ -1651,7 +2027,7 @@ class PostgresFoundationRepository:
             )
             if (
                 original is None
-                or original.posting_type != "opening_stock"
+                or original.posting_type not in {"opening_stock", "receipt"}
                 or original.status != "posted"
             ):
                 raise _error(status.HTTP_404_NOT_FOUND, "INVENTORY_POSTING_NOT_REVERSIBLE")
@@ -1682,7 +2058,11 @@ class PostgresFoundationRepository:
             original_lines = session.scalars(
                 select(InventoryLedgerLine)
                 .where(InventoryLedgerLine.posting_id == original.id)
-                .order_by(InventoryLedgerLine.product_definition_id)
+                .order_by(
+                    InventoryLedgerLine.product_definition_id,
+                    InventoryLedgerLine.batch_number,
+                    InventoryLedgerLine.id,
+                )
             ).all()
             for original_line in original_lines:
                 frozen = build_reversal_line(
@@ -1708,11 +2088,16 @@ class PostgresFoundationRepository:
                         product_definition_id=original_line.product_definition_id,
                         configuration_product_version_id=original_line.configuration_product_version_id,
                         product_price_version_id=original_line.product_price_version_id,
+                        reversal_of_line_id=original_line.id,
+                        batch_number=original_line.batch_number,
+                        manufacture_date=original_line.manufacture_date,
+                        expiry_date=original_line.expiry_date,
                         entered_quantity=Decimal(frozen["entered_quantity"]),
                         entered_unit_code=original_line.entered_unit_code,
                         canonical_signed_quantity=Decimal(frozen["canonical_signed_quantity"]),
                         canonical_unit_code=original_line.canonical_unit_code,
                         price_status=original_line.price_status,
+                        cost_source=original_line.cost_source,
                         applied_unit_price=original_line.applied_unit_price,
                         price_basis_unit_code=original_line.price_basis_unit_code,
                         price_effective_from=original_line.price_effective_from,

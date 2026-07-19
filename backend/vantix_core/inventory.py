@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any
+from unicodedata import normalize
 
 UNIT_DIMENSIONS = {
     "kg": "mass",
@@ -89,6 +90,15 @@ def currency_minor_unit_scale(currency: str) -> int:
 
 def money_string(value: Decimal, scale: int) -> str:
     return format(value, f".{scale}f")
+
+
+def normalise_receipt_reference(value: str, *, field: str) -> tuple[str, str]:
+    stored = " ".join(normalize("NFC", value).strip().split())
+    if not stored:
+        raise InventoryValidationError(
+            "RECEIPT_REFERENCE_REQUIRED", field, "A non-empty receipt reference is required."
+        )
+    return stored, stored.lower()
 
 
 def canonical_quantity(value: Decimal) -> Decimal:
@@ -240,6 +250,7 @@ def build_opening_line(
         "canonical_signed_quantity": canonical_quantity,
         "canonical_unit_code": canonical_unit,
         "price_status": "unavailable",
+        "cost_source": "unavailable",
         "product_price_version_id": None,
         "applied_unit_price": None,
         "price_basis_unit_code": None,
@@ -253,6 +264,7 @@ def build_opening_line(
         result.update(
             {
                 "price_status": "ready",
+                "cost_source": "configured_effective_price",
                 "product_price_version_id": str(price["id"]),
                 "applied_unit_price": decimal_string(Decimal(str(price["unit_price"]))),
                 "price_basis_unit_code": str(price["price_basis_unit_code"]),
@@ -273,6 +285,76 @@ def build_opening_line(
             }
         )
     return result
+
+
+def build_receipt_line(
+    *,
+    entered_quantity: str,
+    entered_unit_code: str,
+    product: Mapping[str, Any],
+    supplier_price: Mapping[str, Any] | None,
+    configured_price: Mapping[str, Any] | None,
+    project_currency: str,
+) -> dict[str, Any]:
+    """Freeze one positive supplier-receipt line using explicit price precedence."""
+
+    if supplier_price is None:
+        return build_opening_line(
+            entered_quantity=entered_quantity,
+            entered_unit_code=entered_unit_code,
+            product=product,
+            price=configured_price,
+        )
+
+    currency = str(supplier_price["currency"]).upper()
+    if currency != project_currency.upper():
+        raise InventoryValidationError(
+            "SUPPLIER_PRICE_CURRENCY_MISMATCH",
+            "supplier_price.currency",
+            "Supplier price currency must match project currency.",
+        )
+    unit_price = _decimal(
+        str(supplier_price["unit_price"]),
+        code="SUPPLIER_PRICE_INVALID",
+        field="supplier_price.unit_price",
+    )
+    if unit_price < 0:
+        raise InventoryValidationError(
+            "SUPPLIER_PRICE_INVALID",
+            "supplier_price.unit_price",
+            "Supplier price cannot be negative.",
+        )
+    canonical, canonical_unit = convert_opening_quantity(
+        entered_quantity,
+        entered_unit_code,
+        package_size=str(product["package_size"]),
+        package_unit_code=str(product["package_unit_code"]),
+    )
+    basis = str(supplier_price["price_basis_unit_code"])
+    scale = currency_minor_unit_scale(currency)
+    return {
+        "entered_quantity": decimal_string(Decimal(entered_quantity)),
+        "entered_unit_code": entered_unit_code,
+        "canonical_signed_quantity": canonical,
+        "canonical_unit_code": canonical_unit,
+        "price_status": "ready",
+        "cost_source": "supplier_document",
+        "product_price_version_id": None,
+        "applied_unit_price": decimal_string(unit_price),
+        "price_basis_unit_code": basis,
+        "currency": currency,
+        "currency_minor_unit_scale": scale,
+        "price_effective_from": None,
+        "price_effective_to": None,
+        "posted_line_amount": calculate_posted_amount(
+            canonical,
+            price_basis_unit_code=basis,
+            unit_price=str(unit_price),
+            package_size=str(product["package_size"]),
+            package_unit_code=str(product["package_unit_code"]),
+            currency=currency,
+        ),
+    }
 
 
 def build_reversal_line(line: Mapping[str, Any]) -> dict[str, Any]:

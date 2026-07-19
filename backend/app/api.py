@@ -15,9 +15,11 @@ from vantix_core.canonical import payload_checksum
 from vantix_core.inventory import (
     InventoryValidationError,
     build_opening_line,
+    build_receipt_line,
     build_reversal_line,
     calculate_package_count,
     money_string,
+    normalise_receipt_reference,
 )
 from vantix_core.lifecycle import (
     ConfigurationSnapshot,
@@ -71,6 +73,10 @@ from .schemas import (
     ProjectProductView,
     ProjectView,
     ReadinessView,
+    ReceiptAuthorityView,
+    ReceiptCreate,
+    ReceiptPreviewLine,
+    ReceiptPreviewView,
     ReportView,
     RevisionView,
 )
@@ -1123,6 +1129,10 @@ def post_opening_stock(
                 "product_definition_id": product["product_definition_id"],
                 "configuration_product_version_id": product["id"],
                 **frozen,
+                "reversal_of_line_id": None,
+                "batch_number": None,
+                "manufacture_date": None,
+                "expiry_date": None,
                 "frozen_product": deepcopy(frozen_product),
             }
             lines.append(line)
@@ -1148,6 +1158,300 @@ def post_opening_stock(
         return repository.idempotent(
             organisation_id=auth.organisation_id,
             operation_type="post_opening_stock",
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            operation=post,
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail={"code": "IDEMPOTENCY_KEY_REUSED"}
+        ) from exc
+
+
+def _memory_resolve_receipt_lines(
+    repository: FoundationStore, project: ProjectRecord, body: ReceiptCreate
+) -> list[dict[str, Any]]:
+    if (
+        project.active_snapshot is None
+        or project.active_snapshot.id != body.expected_configuration_snapshot_id
+    ):
+        raise HTTPException(
+            status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "INVENTORY_AUTHORITY_CHANGED"},
+        )
+    products = {
+        UUID(str(item["product_definition_id"])): item
+        for item in _memory_active_products(repository, project)
+    }
+    seen: set[tuple[UUID, str]] = set()
+    resolved: list[dict[str, Any]] = []
+    for requested in body.lines:
+        product = products.get(requested.product_definition_id)
+        if product is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "RECEIPT_PRODUCT_NOT_AUTHORISED"},
+            )
+        batch = " ".join((requested.batch_number or "").strip().split()) or None
+        identity = (requested.product_definition_id, (batch or "").lower())
+        if identity in seen:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "DUPLICATE_RECEIPT_LINE"},
+            )
+        seen.add(identity)
+        configured_price = select_effective_price(
+            [
+                value
+                for value in repository.product_prices.values()
+                if value["project_product_id"] == product["id"]
+            ],
+            body.posting_date,
+        )
+        frozen_product = {
+            key: product.get(key)
+            for key in (
+                "item_code",
+                "item_name",
+                "alternate_name",
+                "packaging",
+                "package_size",
+                "package_unit_code",
+                "inventory_unit_code",
+                "specific_gravity",
+            )
+        }
+        try:
+            frozen = build_receipt_line(
+                entered_quantity=requested.entered_quantity,
+                entered_unit_code=requested.entered_unit_code,
+                product=frozen_product,
+                supplier_price=(
+                    requested.supplier_price.model_dump()
+                    if requested.supplier_price is not None
+                    else None
+                ),
+                configured_price=configured_price,
+                project_currency=project.currency,
+            )
+            package_count = calculate_package_count(
+                frozen["canonical_signed_quantity"],
+                package_size=str(frozen_product["package_size"]),
+                package_unit_code=str(frozen_product["package_unit_code"]),
+            )
+        except InventoryValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": exc.code, "message": str(exc), "field": exc.field},
+            ) from exc
+        resolved.append(
+            {
+                "product": product,
+                "frozen_product": frozen_product,
+                "frozen": frozen,
+                "package_count": package_count,
+                "batch_number": batch,
+                "manufacture_date": requested.manufacture_date,
+                "expiry_date": requested.expiry_date,
+            }
+        )
+    return resolved
+
+
+def _memory_receipt_preview(
+    project_id: UUID, body: ReceiptCreate, resolved: list[dict[str, Any]]
+) -> ReceiptPreviewView:
+    supplier, _ = normalise_receipt_reference(body.supplier_name, field="supplier_name")
+    delivery, _ = normalise_receipt_reference(
+        body.delivery_note_number, field="delivery_note_number"
+    )
+    totals: dict[str, Decimal] = {}
+    scales: dict[str, int] = {}
+    lines: list[ReceiptPreviewLine] = []
+    for item in resolved:
+        product = item["product"]
+        frozen = item["frozen"]
+        if frozen["posted_line_amount"] is not None:
+            currency = frozen["currency"]
+            totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
+                frozen["posted_line_amount"]
+            )
+            scales[currency] = frozen["currency_minor_unit_scale"]
+        lines.append(
+            ReceiptPreviewLine(
+                product_definition_id=product["product_definition_id"],
+                configuration_product_version_id=product["id"],
+                item_code=product["item_code"],
+                item_name=product["item_name"],
+                entered_quantity=frozen["entered_quantity"],
+                entered_unit_code=frozen["entered_unit_code"],
+                package_size=str(item["frozen_product"]["package_size"]),
+                package_unit_code=item["frozen_product"]["package_unit_code"],
+                canonical_quantity=frozen["canonical_signed_quantity"],
+                canonical_unit_code=frozen["canonical_unit_code"],
+                package_count=item["package_count"],
+                price_status=frozen["price_status"],
+                applied_unit_price=frozen["applied_unit_price"],
+                price_basis_unit_code=frozen["price_basis_unit_code"],
+                price_effective_from=frozen["price_effective_from"],
+                price_effective_to=frozen["price_effective_to"],
+                currency=frozen["currency"],
+                currency_minor_unit_scale=frozen["currency_minor_unit_scale"],
+                line_amount=frozen["posted_line_amount"],
+                batch_number=item["batch_number"],
+                manufacture_date=item["manufacture_date"],
+                expiry_date=item["expiry_date"],
+                cost_source=frozen["cost_source"],
+            )
+        )
+    return ReceiptPreviewView(
+        project_id=project_id,
+        posting_date=body.posting_date,
+        configuration_snapshot_id=body.expected_configuration_snapshot_id,
+        supplier_name=supplier,
+        delivery_note_number=delivery,
+        purchase_order_reference=body.purchase_order_reference,
+        invoice_reference=body.invoice_reference,
+        lines=lines,
+        currencies={
+            currency: money_string(amount, scales[currency]) for currency, amount in totals.items()
+        },
+    )
+
+
+@router.get(
+    "/projects/{project_id}/inventory/receipt-authority",
+    response_model=ReceiptAuthorityView,
+)
+def receipt_authority(
+    project_id: UUID,
+    posting_date: date,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ReceiptAuthorityView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.receipt_authority(auth, project_id, posting_date)
+    project = _project(project_id, auth, repository)
+    authority = opening_stock_authority(project_id, posting_date, auth, repository)
+    return ReceiptAuthorityView(
+        project_id=authority.project_id,
+        posting_date=authority.posting_date,
+        configuration_snapshot_id=authority.configuration_snapshot_id,
+        project_currency=project.currency,
+        products=[
+            product.model_copy(update={"opened_by_posting_id": None})
+            for product in authority.products
+        ],
+    )
+
+
+@router.post(
+    "/projects/{project_id}/inventory-postings/receipts/preview",
+    response_model=ReceiptPreviewView,
+)
+def preview_receipt(
+    project_id: UUID,
+    body: ReceiptCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+) -> ReceiptPreviewView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.preview_receipt(auth, project_id, body)
+    if not auth.capabilities.intersection({Capability.VIEW_INVENTORY, Capability.POST_INVENTORY}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail={"code": "CAPABILITY_DENIED"})
+    project = _project(project_id, auth, repository)
+    resolved = _memory_resolve_receipt_lines(repository, project, body)
+    return _memory_receipt_preview(project_id, body, resolved)
+
+
+@router.post(
+    "/projects/{project_id}/inventory-postings/receipts",
+    response_model=InventoryPostingView,
+    status_code=201,
+)
+def post_receipt(
+    project_id: UUID,
+    body: ReceiptCreate,
+    auth: AuthContext = Depends(auth_context),
+    repository: Repository = Depends(get_store),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+) -> InventoryPostingView:
+    if isinstance(repository, PostgresFoundationRepository):
+        return repository.post_receipt(auth, project_id, body, idempotency_key)
+    auth.require(Capability.POST_INVENTORY)
+    project = _project(project_id, auth, repository)
+    request_hash = _request_hash({"project_id": str(project_id), **body.model_dump(mode="json")})
+
+    def post() -> InventoryPostingView:
+        supplier, supplier_normalized = normalise_receipt_reference(
+            body.supplier_name, field="supplier_name"
+        )
+        delivery, delivery_normalized = normalise_receipt_reference(
+            body.delivery_note_number, field="delivery_note_number"
+        )
+        duplicate = next(
+            (
+                value
+                for value in repository.inventory_postings.values()
+                if value["project_id"] == project_id
+                and value["posting_type"] == "receipt"
+                and value.get("supplier_name_normalized") == supplier_normalized
+                and value.get("delivery_note_normalized") == delivery_normalized
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"code": "RECEIPT_DELIVERY_NOTE_EXISTS"},
+            )
+        resolved = _memory_resolve_receipt_lines(repository, project, body)
+        assert project.active_snapshot is not None
+        posting_id = uuid4()
+        lines: list[dict[str, Any]] = []
+        for item in resolved:
+            line_id = uuid4()
+            line = {
+                "id": line_id,
+                "product_definition_id": item["product"]["product_definition_id"],
+                "configuration_product_version_id": item["product"]["id"],
+                **item["frozen"],
+                "reversal_of_line_id": None,
+                "batch_number": item["batch_number"],
+                "manufacture_date": item["manufacture_date"],
+                "expiry_date": item["expiry_date"],
+                "frozen_product": deepcopy(item["frozen_product"]),
+            }
+            lines.append(line)
+            repository.inventory_lines[line_id] = {**line, "posting_id": posting_id}
+        stored = {
+            "id": posting_id,
+            "project_id": project_id,
+            "source_configuration_snapshot_id": project.active_snapshot.id,
+            "posting_type": "receipt",
+            "status": "posted",
+            "posting_date": body.posting_date,
+            "reversal_of_posting_id": None,
+            "reversal_posting_id": None,
+            "reason": None,
+            "supplier_name": supplier,
+            "supplier_name_normalized": supplier_normalized,
+            "delivery_note_number": delivery,
+            "delivery_note_normalized": delivery_normalized,
+            "purchase_order_reference": body.purchase_order_reference,
+            "invoice_reference": body.invoice_reference,
+            "received_by_user_id": auth.user_id,
+            "posted_by": auth.user_id,
+            "posted_at": datetime.now(UTC),
+            "lines": lines,
+        }
+        repository.inventory_postings[posting_id] = stored
+        return InventoryPostingView.model_validate(stored)
+
+    try:
+        return repository.idempotent(
+            organisation_id=auth.organisation_id,
+            operation_type="post_inventory_receipt",
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             operation=post,
@@ -1214,7 +1518,7 @@ def reverse_inventory_posting(
         if (
             not original
             or original["project_id"] != project_id
-            or original["posting_type"] != "opening_stock"
+            or original["posting_type"] not in {"opening_stock", "receipt"}
         ):
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, detail={"code": "INVENTORY_POSTING_NOT_REVERSIBLE"}
@@ -1233,7 +1537,12 @@ def reverse_inventory_posting(
         for source in original["lines"]:
             frozen = build_reversal_line(source)
             line_id = uuid4()
-            line = {**source, **frozen, "id": line_id}
+            line = {
+                **source,
+                **frozen,
+                "id": line_id,
+                "reversal_of_line_id": source["id"],
+            }
             lines.append(line)
             repository.inventory_lines[line_id] = {**line, "posting_id": reversal_id}
         stored = {
