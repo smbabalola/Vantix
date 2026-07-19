@@ -12,6 +12,7 @@
 - [x] Make Vite dev proxy target overridable via `VANTIX_API_PROXY` env var (`d43f2a8`, pushed)
 - [x] Verify receipt reversal flow: reversal posted with exact negated frozen values (−1,000 kg, GBP −770.00), receipt/reversal cross-linked, UI hides the reversal panel for already-reversed receipts
 - [x] Frontend test suite green: 6 files, 16 tests passed (vitest)
+- [x] Backend test suite green on main: 56 passed, 2 Windows-only skips (pytest)
 
 ## In progress / known issues
 
