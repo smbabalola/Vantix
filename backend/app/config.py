@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VANTIX_", env_file=".env", extra="ignore")
 
     environment: str = "development"
-    database_url: str = "postgresql+psycopg://vantix:vantix@localhost:5432/vantix"
+    database_url: str = "postgresql+psycopg://vantix:vantix@localhost:5435/vantix"
     repository_backend: str = "postgres"
     oidc_issuer: str = ""
     oidc_audience: str = "vantix-api"
