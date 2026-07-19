@@ -39,6 +39,9 @@ export default function Bootstrap() {
   if (error) {
     return <main className="empty-shell"><div className="brand-mark">V</div><h1>Report unavailable</h1><p>{error}</p><span className="state-badge state-incomplete">Failed</span></main>;
   }
+  if (session && reportId && !report) {
+    return <main className="empty-shell"><div className="brand-mark">V</div><h1>Opening report</h1><span className="state-badge state-incomplete">Loading</span></main>;
+  }
   if (session && projectId && workspace === "opening-stock") {
     return <OpeningStockWorkspace projectId={projectId} session={session} />;
   }
